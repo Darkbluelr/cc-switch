@@ -182,6 +182,23 @@ async fn handle_claude_transform(
             let start_time = ctx.start_time;
 
             SseUsageCollector::new(start_time, move |events, first_token_ms| {
+                // 完整性检测：Claude 的转换流应以 `message_stop` 结束；未见终止事件
+                // 说明上游中途关流，把该 provider 放进短冷却。
+                let stream_complete = events
+                    .iter()
+                    .any(|e| e.get("type").and_then(|t| t.as_str()) == Some("message_stop"));
+                if !stream_complete {
+                    log::warn!(
+                        "[Claude] [FWD-020] 流式响应未见 message_stop（疑似上游中途关流），\
+                        provider {provider_id} 进入短冷却"
+                    );
+                    let router = state.provider_router.clone();
+                    let pid = provider_id.clone();
+                    tokio::spawn(async move {
+                        router.record_transient_failure(&pid, "claude", None).await;
+                    });
+                }
+
                 if let Some(usage) = TokenUsage::from_claude_stream_events(&events) {
                     let latency_ms = start_time.elapsed().as_millis() as u64;
                     let state = state.clone();

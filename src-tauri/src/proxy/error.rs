@@ -40,7 +40,13 @@ pub enum ProxyError {
     ProviderUnhealthy(String),
 
     #[error("上游错误 (状态码 {status}): {body:?}")]
-    UpstreamError { status: u16, body: Option<String> },
+    UpstreamError {
+        status: u16,
+        body: Option<String>,
+        /// 上游 `Retry-After` 头（毫秒）。仅做"冷却时长建议"，与状态码无关 ——
+        /// 上游通常在 429/503 上发送，但路由层处理逻辑对所有可重试错误一致。
+        retry_after_ms: Option<u64>,
+    },
 
     #[error("超过最大重试次数")]
     MaxRetriesExceeded,
@@ -78,10 +84,11 @@ pub enum ProxyError {
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
-        let (status, body) = match &self {
+        let (status, body, retry_after_ms) = match &self {
             ProxyError::UpstreamError {
                 status: upstream_status,
                 body: upstream_body,
+                retry_after_ms,
             } => {
                 let http_status =
                     StatusCode::from_u16(*upstream_status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -109,7 +116,7 @@ impl IntoResponse for ProxyError {
                     })
                 };
 
-                (http_status, error_body)
+                (http_status, error_body, *retry_after_ms)
             }
             _ => {
                 let (http_status, message) = match &self {
@@ -166,11 +173,21 @@ impl IntoResponse for ProxyError {
                     }
                 });
 
-                (http_status, error_body)
+                (http_status, error_body, None)
             }
         };
 
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        // 透传 Retry-After 头：上游给了冷却建议就还给客户端
+        if let Some(ms) = retry_after_ms {
+            let secs = (ms as f64 / 1000.0).ceil() as u64;
+            if let Ok(val) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, val);
+            }
+        }
+        response
     }
 }
 

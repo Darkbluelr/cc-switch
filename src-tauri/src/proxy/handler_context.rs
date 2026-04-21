@@ -124,9 +124,18 @@ impl RequestContext {
 
         // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
         // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
+        //
+        // 会话亲和：只在客户端明确提供了 session 标识时启用，让同一会话尽量粘到同一
+        // provider 以最大化 prompt cache 命中率；我们自己生成的兜底 UUID 不传，避免
+        // 污染 RR 分布。
+        let session_affinity_key = if session_result.client_provided {
+            Some(session_id.as_str())
+        } else {
+            None
+        };
         let providers = state
             .provider_router
-            .select_providers(app_type_str)
+            .select_providers(app_type_str, session_affinity_key)
             .await
             .map_err(|e| match e {
                 crate::error::AppError::AllProvidersCircuitOpen => {

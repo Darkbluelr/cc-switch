@@ -7,10 +7,24 @@ use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
 use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerConfig};
+use crate::proxy::cooldown::CooldownTracker;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// 把字符串稳定映射到 [0, len) 的偏移量（session 亲和用）
+fn hash_to_offset(key: &str, len: usize) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) % len
+}
 
 /// 供应商路由器
 pub struct ProviderRouter {
@@ -18,6 +32,13 @@ pub struct ProviderRouter {
     db: Arc<Database>,
     /// 熔断器管理器 - key 格式: "app_type:provider_id"
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
+    /// 瞬时失败短冷却跟踪器：任何可重试错误都短暂跳过该 key，与长期熔断解耦
+    cooldown: Arc<CooldownTracker>,
+    /// Round-Robin 游标 - 每个 app_type 一个，作用于"可用候选列表"的起点
+    ///
+    /// 当候选数 > 1 且启用故障转移时，在选路阶段按请求轮转起点，
+    /// 使流量在多个等价 key 之间天然均摊，避免"永远先砸 P1"。
+    round_robin_cursors: Arc<RwLock<HashMap<String, Arc<AtomicUsize>>>>,
 }
 
 impl ProviderRouter {
@@ -26,18 +47,58 @@ impl ProviderRouter {
         Self {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            cooldown: CooldownTracker::new(),
+            round_robin_cursors: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// 选择可用的供应商（支持故障转移）
+    /// 获取冷却跟踪器（供 forwarder 在瞬时失败时直接记录）
+    #[allow(dead_code)]
+    pub fn cooldown(&self) -> Arc<CooldownTracker> {
+        self.cooldown.clone()
+    }
+
+    /// 记录一次瞬时失败，返回本次冷却时长（ms）
+    ///
+    /// 调用方应对"可重试"错误统一调用此方法（429/5xx/超时/连接失败等），
+    /// 它只影响短期选路，不污染熔断器健康统计；熔断器由独立的 `record_result`
+    /// 按"真失败"口径累积。
+    pub async fn record_transient_failure(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+        hint_ms: Option<u64>,
+    ) -> u64 {
+        self.cooldown
+            .record_failure(app_type, provider_id, hint_ms)
+            .await
+    }
+
+    /// 请求成功：清空该 provider 的短冷却状态
+    pub async fn clear_transient_failure(&self, provider_id: &str, app_type: &str) {
+        self.cooldown.clear(app_type, provider_id).await;
+    }
+
+    /// 选择可用的供应商（支持故障转移 + 会话亲和 + Round-Robin）
     ///
     /// 返回按优先级排序的可用供应商列表：
     /// - 故障转移关闭时：仅返回当前供应商
-    /// - 故障转移开启时：仅使用故障转移队列，按队列顺序依次尝试（P1 → P2 → ...）
-    pub async fn select_providers(&self, app_type: &str) -> Result<Vec<Provider>, AppError> {
+    /// - 故障转移开启时：过滤掉冷却/熔断 provider 后，按如下优先级决定起点
+    ///   1. `session_key` 有值 → 一致性哈希起点（让同一会话尽量命中同一 key，利好 prompt cache）
+    ///   2. 否则 → Round-Robin 游标起点（跨会话均摊流量）
+    ///
+    /// `session_key` 只应在客户端明确提供了会话标识时传入（比如 Claude 的
+    /// `x-claude-code-session-id` 或 Codex 的 `session_id` 头），内部新生成的 UUID
+    /// 对缓存命中没帮助，应传 `None` 走 RR。
+    pub async fn select_providers(
+        &self,
+        app_type: &str,
+        session_key: Option<&str>,
+    ) -> Result<Vec<Provider>, AppError> {
         let mut result = Vec::new();
         let mut total_providers = 0usize;
         let mut circuit_open_count = 0usize;
+        let mut rate_limited_count = 0usize;
 
         // 检查该应用的自动故障转移开关是否开启（从 proxy_config 表读取）
         let auto_failover_enabled = match self.db.get_proxy_config_for_app(app_type).await {
@@ -49,7 +110,7 @@ impl ProviderRouter {
         };
 
         if auto_failover_enabled {
-            // 故障转移开启：仅按队列顺序依次尝试（P1 → P2 → ...）
+            // 故障转移开启：从队列中筛选出熔断器允许且未在短冷却期的候选，再按 RR 轮转起点
             let all_providers = self.db.get_all_providers(app_type)?;
 
             // 使用 DAO 返回的排序结果，确保和前端展示一致
@@ -67,13 +128,37 @@ impl ProviderRouter {
                     continue;
                 };
 
+                // 1) 短冷却：跳过刚失败过、仍在退避期的 provider
+                if self.cooldown.is_cooling_down(app_type, &provider.id).await {
+                    rate_limited_count += 1;
+                    continue;
+                }
+
+                // 2) 熔断器：跳过 Open 状态的 provider
                 let circuit_key = format!("{app_type}:{}", provider.id);
                 let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
-
                 if breaker.is_available().await {
                     result.push(provider);
                 } else {
                     circuit_open_count += 1;
+                }
+            }
+
+            // 3) 候选 ≥ 2 时决定"起点"：
+            //    - 客户端提供了 session_key：用一致性哈希粘到同一个 key（有利 prompt cache 命中）
+            //    - 否则：用 RR 游标均摊
+            //    注：当原本粘住的 key 进入冷却/熔断时会被步骤 1/2 过滤掉，哈希会自然落到剩余
+            //    候选里的另一个 provider，天然兼顾"亲和"和"退路"。
+            if result.len() > 1 {
+                let offset = match session_key {
+                    Some(key) if !key.is_empty() => hash_to_offset(key, result.len()),
+                    _ => {
+                        let cursor = self.get_or_create_rr_cursor(app_type).await;
+                        cursor.fetch_add(1, Ordering::Relaxed) % result.len()
+                    }
+                };
+                if offset > 0 {
+                    result.rotate_left(offset);
                 }
             }
         } else {
@@ -96,8 +181,12 @@ impl ProviderRouter {
         }
 
         if result.is_empty() {
-            if total_providers > 0 && circuit_open_count == total_providers {
-                log::warn!("[{app_type}] [FO-004] 所有供应商均已熔断");
+            if total_providers > 0
+                && (circuit_open_count + rate_limited_count) == total_providers
+            {
+                log::warn!(
+                    "[{app_type}] [FO-004] 所有供应商暂不可用（熔断 {circuit_open_count}，冷却 {rate_limited_count}）"
+                );
                 return Err(AppError::AllProvidersCircuitOpen);
             } else {
                 log::warn!("[{app_type}] [FO-005] 未配置供应商");
@@ -106,6 +195,23 @@ impl ProviderRouter {
         }
 
         Ok(result)
+    }
+
+    /// 获取或创建指定 app_type 的 Round-Robin 游标
+    async fn get_or_create_rr_cursor(&self, app_type: &str) -> Arc<AtomicUsize> {
+        {
+            let cursors = self.round_robin_cursors.read().await;
+            if let Some(c) = cursors.get(app_type) {
+                return c.clone();
+            }
+        }
+        let mut cursors = self.round_robin_cursors.write().await;
+        if let Some(c) = cursors.get(app_type) {
+            return c.clone();
+        }
+        let cursor = Arc::new(AtomicUsize::new(0));
+        cursors.insert(app_type.to_string(), cursor.clone());
+        cursor
     }
 
     /// 请求执行前获取熔断器“放行许可”
@@ -343,7 +449,7 @@ mod tests {
         db.add_to_failover_queue("claude", "b").unwrap();
 
         let router = ProviderRouter::new(db.clone());
-        let providers = router.select_providers("claude").await.unwrap();
+        let providers = router.select_providers("claude", None).await.unwrap();
 
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id, "a");
@@ -376,7 +482,7 @@ mod tests {
         db.update_proxy_config_for_app(config).await.unwrap();
 
         let router = ProviderRouter::new(db.clone());
-        let providers = router.select_providers("claude").await.unwrap();
+        let providers = router.select_providers("claude", None).await.unwrap();
 
         assert_eq!(providers.len(), 2);
         // 故障转移开启时：仅按队列顺序选择（忽略当前供应商）
@@ -408,7 +514,7 @@ mod tests {
         db.update_proxy_config_for_app(config).await.unwrap();
 
         let router = ProviderRouter::new(db.clone());
-        let providers = router.select_providers("claude").await.unwrap();
+        let providers = router.select_providers("claude", None).await.unwrap();
 
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id, "b");
@@ -451,7 +557,7 @@ mod tests {
             .await
             .unwrap();
 
-        let providers = router.select_providers("claude").await.unwrap();
+        let providers = router.select_providers("claude", None).await.unwrap();
         assert_eq!(providers.len(), 2);
 
         assert!(router.allow_provider_request("b", "claude").await.allowed);
@@ -508,5 +614,150 @@ mod tests {
         let third = router.allow_provider_request("a", "claude").await;
         assert!(third.allowed);
         assert!(third.used_half_open_permit);
+    }
+
+    /// Round-Robin：连续调用 select_providers 时起点应轮转
+    #[tokio::test]
+    #[serial]
+    async fn test_select_providers_round_robin_rotates_starting_point() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        // 三个 provider，sort_index 固定：a=1, b=2, c=3
+        for (id, idx) in [("a", 1usize), ("b", 2), ("c", 3)] {
+            let mut p = Provider::with_id(
+                id.to_string(),
+                format!("Provider {id}"),
+                json!({}),
+                None,
+            );
+            p.sort_index = Some(idx);
+            db.save_provider("claude", &p).unwrap();
+            db.add_to_failover_queue("claude", id).unwrap();
+        }
+
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+
+        let first = router.select_providers("claude", None).await.unwrap();
+        let second = router.select_providers("claude", None).await.unwrap();
+        let third = router.select_providers("claude", None).await.unwrap();
+
+        // 三次调用的"起点"应分别是 a, b, c（RR 轮转）
+        assert_eq!(first.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]);
+        assert_eq!(second.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+            vec!["b", "c", "a"]);
+        assert_eq!(third.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+            vec!["c", "a", "b"]);
+    }
+
+    /// 冷却过滤：刚失败过的 provider 在冷却期内应被 select 跳过
+    #[tokio::test]
+    #[serial]
+    async fn test_select_providers_skips_providers_in_cooldown() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let mut provider_a =
+            Provider::with_id("a".to_string(), "Provider A".to_string(), json!({}), None);
+        provider_a.sort_index = Some(1);
+        let mut provider_b =
+            Provider::with_id("b".to_string(), "Provider B".to_string(), json!({}), None);
+        provider_b.sort_index = Some(2);
+
+        db.save_provider("claude", &provider_a).unwrap();
+        db.save_provider("claude", &provider_b).unwrap();
+        db.add_to_failover_queue("claude", "a").unwrap();
+        db.add_to_failover_queue("claude", "b").unwrap();
+
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+
+        // 给 a 一个较长的冷却，确保 select 窗口内它一定被过滤
+        router
+            .record_transient_failure("a", "claude", Some(10_000))
+            .await;
+
+        let providers = router.select_providers("claude", None).await.unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id, "b");
+
+        // 显式清除后应重新可选
+        router.clear_transient_failure("a", "claude").await;
+        let providers = router.select_providers("claude", None).await.unwrap();
+        assert_eq!(providers.len(), 2);
+    }
+
+    /// 会话亲和：客户端提供 session_key 时，同一 key 稳定映射到同一起点；
+    /// 起点 provider 被冷却后，哈希会自然落到剩余候选的另一个
+    #[tokio::test]
+    #[serial]
+    async fn test_select_providers_session_affinity_is_stable_and_falls_back() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        for (id, idx) in [("a", 1usize), ("b", 2), ("c", 3)] {
+            let mut p = Provider::with_id(
+                id.to_string(),
+                format!("Provider {id}"),
+                json!({}),
+                None,
+            );
+            p.sort_index = Some(idx);
+            db.save_provider("claude", &p).unwrap();
+            db.add_to_failover_queue("claude", id).unwrap();
+        }
+
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+        let key = Some("session-abc-123");
+
+        // 同一 session_key 多次调用应得到相同起点（稳定亲和）
+        let first = router.select_providers("claude", key).await.unwrap();
+        let second = router.select_providers("claude", key).await.unwrap();
+        assert_eq!(first[0].id, second[0].id);
+
+        // 起点 provider 进入冷却后，哈希会落到剩余候选中的一个，不会卡死
+        router
+            .record_transient_failure(&first[0].id, "claude", Some(10_000))
+            .await;
+        let third = router.select_providers("claude", key).await.unwrap();
+        assert_eq!(third.len(), 2);
+        assert_ne!(third[0].id, first[0].id);
+    }
+
+    /// 冷却 + 熔断同时用尽时应返回 AllProvidersCircuitOpen
+    #[tokio::test]
+    #[serial]
+    async fn test_select_providers_all_unavailable_errors_out() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let provider_a =
+            Provider::with_id("a".to_string(), "Provider A".to_string(), json!({}), None);
+        db.save_provider("claude", &provider_a).unwrap();
+        db.add_to_failover_queue("claude", "a").unwrap();
+
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+        router
+            .record_transient_failure("a", "claude", Some(10_000))
+            .await;
+
+        let err = router.select_providers("claude", None).await.unwrap_err();
+        assert!(matches!(err, AppError::AllProvidersCircuitOpen));
     }
 }

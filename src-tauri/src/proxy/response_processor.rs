@@ -418,6 +418,26 @@ impl SseUsageCollector {
 // 内部辅助函数
 // ============================================================================
 
+/// SSE 流是否见到终止事件
+///
+/// 用于识别"假 200"：HTTP 层正常关闭，但 SSE 事件流里没有终止事件，意味着上游
+/// 中途把流关了、响应语义上不完整。此时路由层应把该 provider 放进短冷却，
+/// 避免下一个请求再命中同一个"坏流" key。
+///
+/// - Codex (Responses API)：终止事件为 `response.completed`
+/// - Claude (Messages API)：终止事件为 `message_stop`
+/// - 其他应用：暂不做完整性判定，返回 `true`（按已完成处理）
+fn is_stream_complete(events: &[Value], app_type: &str) -> bool {
+    let terminal_type = match app_type {
+        "codex" => "response.completed",
+        "claude" => "message_stop",
+        _ => return true,
+    };
+    events
+        .iter()
+        .any(|e| e.get("type").and_then(|t| t.as_str()) == Some(terminal_type))
+}
+
 /// 创建使用量收集器
 fn create_usage_collector(
     ctx: &RequestContext,
@@ -441,6 +461,21 @@ fn create_usage_collector(
     let session_id = ctx.session_id.clone();
 
     SseUsageCollector::new(start_time, move |events, first_token_ms| {
+        // 完整性检测：对 Codex/Claude 的流式响应，若未见终止事件，则判为上游中途
+        // 关流的"假 200"，把该 provider 放进短冷却（独立于 usage 日志逻辑）。
+        if !is_stream_complete(&events, app_type_str) {
+            log::warn!(
+                "[{tag}] [FWD-020] 流式响应未见终止事件（疑似上游中途关流），\
+                provider {provider_id} 进入短冷却"
+            );
+            let router = state.provider_router.clone();
+            let pid = provider_id.clone();
+            let app_type = app_type_str.to_string();
+            tokio::spawn(async move {
+                router.record_transient_failure(&pid, &app_type, None).await;
+            });
+        }
+
         if !logging_enabled {
             return;
         }
@@ -794,6 +829,49 @@ mod tests {
             headers.get(axum::http::header::CONTENT_LENGTH),
             Some(&axum::http::HeaderValue::from_static("12"))
         );
+    }
+
+    #[test]
+    fn test_is_stream_complete_codex_requires_response_completed() {
+        let incomplete = vec![
+            serde_json::json!({"type": "response.created", "response": {}}),
+            serde_json::json!({"type": "response.output_text.delta", "delta": "hi"}),
+        ];
+        assert!(!is_stream_complete(&incomplete, "codex"));
+
+        let complete = vec![
+            serde_json::json!({"type": "response.created", "response": {}}),
+            serde_json::json!({"type": "response.completed", "response": {}}),
+        ];
+        assert!(is_stream_complete(&complete, "codex"));
+    }
+
+    #[test]
+    fn test_is_stream_complete_claude_requires_message_stop() {
+        let incomplete = vec![
+            serde_json::json!({"type": "message_start", "message": {}}),
+            serde_json::json!({"type": "content_block_delta", "delta": {}}),
+        ];
+        assert!(!is_stream_complete(&incomplete, "claude"));
+
+        let complete = vec![
+            serde_json::json!({"type": "message_start", "message": {}}),
+            serde_json::json!({"type": "message_stop"}),
+        ];
+        assert!(is_stream_complete(&complete, "claude"));
+    }
+
+    #[test]
+    fn test_is_stream_complete_unknown_app_type_is_lenient() {
+        // 未识别的 app_type 默认视为已完成，避免误伤
+        assert!(is_stream_complete(&[], "gemini"));
+        assert!(is_stream_complete(&[], "something-else"));
+    }
+
+    #[test]
+    fn test_is_stream_complete_empty_events_is_incomplete_for_known_types() {
+        assert!(!is_stream_complete(&[], "codex"));
+        assert!(!is_stream_complete(&[], "claude"));
     }
 
     #[test]

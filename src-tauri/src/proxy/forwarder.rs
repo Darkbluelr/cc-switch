@@ -196,7 +196,7 @@ impl RequestForwarder {
                 .await
             {
                 Ok((response, claude_api_format)) => {
-                    // 成功：记录成功并更新熔断器
+                    // 成功：记录成功并更新熔断器、清除短冷却
                     let _ = self
                         .router
                         .record_result(
@@ -206,6 +206,9 @@ impl RequestForwarder {
                             true,
                             None,
                         )
+                        .await;
+                    self.router
+                        .clear_transient_failure(&provider.id, app_type_str)
                         .await;
 
                     // 更新当前应用类型使用的 provider
@@ -669,7 +672,13 @@ impl RequestForwarder {
 
                     match category {
                         ErrorCategory::Retryable => {
-                            // 可重试：更新错误信息，继续尝试下一个供应商
+                            // 可重试失败：把该 provider 放入短冷却，下次选路直接跳过
+                            let hint_ms = extract_retry_after_ms(&e);
+                            let cooldown_ms = self
+                                .router
+                                .record_transient_failure(&provider.id, app_type_str, hint_ms)
+                                .await;
+
                             {
                                 let mut status = self.status.write().await;
                                 status.last_error =
@@ -682,7 +691,9 @@ impl RequestForwarder {
                                 providers.len(),
                                 &e,
                             );
-                            log::warn!("[{app_type_str}] [{log_code}] {log_message}");
+                            log::warn!(
+                                "[{app_type_str}] [{log_code}] {log_message}（冷却 {cooldown_ms}ms）"
+                            );
 
                             last_error = Some(e);
                             last_provider = Some(provider.clone());
@@ -1427,11 +1438,15 @@ impl RequestForwarder {
             Ok((response, resolved_claude_api_format))
         } else {
             let status_code = status.as_u16();
+            // 先提取 Retry-After 头（body() 会消费 response）
+            let retry_after_ms =
+                super::cooldown::parse_retry_after_ms(response.headers());
             let body_text = String::from_utf8(response.bytes().await?.to_vec()).ok();
 
             Err(ProxyError::UpstreamError {
                 status: status_code,
                 body: body_text,
+                retry_after_ms,
             })
         }
     }
@@ -1529,6 +1544,16 @@ fn extract_error_message(error: &ProxyError) -> Option<String> {
     }
 }
 
+/// 提取上游 `Retry-After` 建议（毫秒），供短冷却使用
+fn extract_retry_after_ms(error: &ProxyError) -> Option<u64> {
+    match error {
+        ProxyError::UpstreamError {
+            retry_after_ms, ..
+        } => *retry_after_ms,
+        _ => None,
+    }
+}
+
 /// 检测 Provider 是否为 Bedrock（通过 CLAUDE_CODE_USE_BEDROCK 环境变量判断）
 fn is_bedrock_provider(provider: &Provider) -> bool {
     provider
@@ -1586,7 +1611,7 @@ fn build_terminal_failure_log(
 
 fn summarize_proxy_error(error: &ProxyError) -> String {
     match error {
-        ProxyError::UpstreamError { status, body } => {
+        ProxyError::UpstreamError { status, body, .. } => {
             let body_summary = body
                 .as_deref()
                 .map(summarize_upstream_body)
@@ -1816,6 +1841,7 @@ mod tests {
         let error = ProxyError::UpstreamError {
             status: 429,
             body: Some(r#"{"error":{"message":"rate limit exceeded"}}"#.to_string()),
+            retry_after_ms: None,
         };
 
         let (code, message) = build_retryable_failure_log("PackyCode-response", 1, 1, &error);

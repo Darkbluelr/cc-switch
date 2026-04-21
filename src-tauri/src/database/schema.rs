@@ -145,7 +145,7 @@ impl Database {
                 streaming_first_byte_timeout, streaming_idle_timeout, non_streaming_timeout,
                 circuit_failure_threshold, circuit_success_threshold, circuit_timeout_seconds,
                 circuit_error_rate_threshold, circuit_min_requests)
-                VALUES ('claude', 6, 90, 180, 600, 8, 3, 90, 0.7, 15)",
+                VALUES ('claude', 6, 90, 180, 600, 4, 2, 60, 0.5, 10)",
                 [],
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
