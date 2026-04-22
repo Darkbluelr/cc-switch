@@ -118,6 +118,9 @@ impl Database {
             FROM proxy_request_logs
             WHERE app_type = ?1
               AND created_at > ?2
+              -- 只算真实走过代理的请求，排除本地 JSONL 日志同步（session_log）
+              -- 那些记录 provider_id 是占位符（_codex_session 等），不代表失败
+              AND data_source = 'proxy'
             GROUP BY provider_id
         ";
 
@@ -202,14 +205,45 @@ mod tests {
         first_token_ms: Option<u64>,
         created_at: i64,
     ) {
+        insert_log_with_source(
+            conn,
+            provider_id,
+            app_type,
+            status_code,
+            is_streaming,
+            input_tokens,
+            cache_read,
+            cache_creation,
+            output_tokens,
+            first_token_ms,
+            created_at,
+            "proxy",
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_log_with_source(
+        conn: &rusqlite::Connection,
+        provider_id: &str,
+        app_type: &str,
+        status_code: i32,
+        is_streaming: bool,
+        input_tokens: u64,
+        cache_read: u64,
+        cache_creation: u64,
+        output_tokens: u64,
+        first_token_ms: Option<u64>,
+        created_at: i64,
+        data_source: &str,
+    ) {
         conn.execute(
             "INSERT INTO proxy_request_logs (
                 request_id, provider_id, app_type, model,
                 input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
                 input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd,
                 total_cost_usd, latency_ms, first_token_ms, status_code,
-                is_streaming, cost_multiplier, created_at
-            ) VALUES (?1, ?2, ?3, 'gpt-5.2', ?4, ?5, ?6, ?7, '0', '0', '0', '0', '0', 100, ?8, ?9, ?10, '1', ?11)",
+                is_streaming, cost_multiplier, created_at, data_source
+            ) VALUES (?1, ?2, ?3, 'gpt-5.2', ?4, ?5, ?6, ?7, '0', '0', '0', '0', '0', 100, ?8, ?9, ?10, '1', ?11, ?12)",
             rusqlite::params![
                 uuid::Uuid::new_v4().to_string(),
                 provider_id,
@@ -222,6 +256,7 @@ mod tests {
                 status_code,
                 if is_streaming { 1 } else { 0 },
                 created_at,
+                data_source,
             ],
         )
         .expect("insert log");
@@ -338,6 +373,35 @@ mod tests {
         let db = Database::memory().unwrap();
         let metrics = db.get_provider_health_metrics("codex", 300).unwrap();
         assert!(metrics.is_empty());
+    }
+
+    #[test]
+    fn session_log_records_are_excluded_from_metrics() {
+        let db = Database::memory().unwrap();
+        let t = now();
+        {
+            let conn = db.conn.lock().unwrap();
+            // 真实代理记录
+            insert_log(&conn, "p1", "codex", 200, true, 1000, 900, 0, 100, Some(500), t);
+            // session_log 同一请求的"镜像"记录（占位 provider_id，0 tokens 是常见情况）
+            insert_log_with_source(
+                &conn, "_codex_session", "codex", 200, true, 0, 0, 0, 0, None, t,
+                "session_log",
+            );
+            insert_log_with_source(
+                &conn, "p1", "codex", 200, true, 500, 400, 0, 50, Some(300), t,
+                "session_log",
+            );
+        }
+
+        let metrics = db.get_provider_health_metrics("codex", 300).unwrap();
+        // 仅应出现 p1，来自 proxy；_codex_session / p1(session_log) 均被过滤掉
+        assert_eq!(metrics.len(), 1);
+        let m = &metrics[0];
+        assert_eq!(m.provider_id, "p1");
+        assert_eq!(m.total_requests, 1);
+        assert_eq!(m.cache_read_tokens, 900);
+        assert_eq!(m.prompt_total_tokens, 1000);
     }
 
     #[test]

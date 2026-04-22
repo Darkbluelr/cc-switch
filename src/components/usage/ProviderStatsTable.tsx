@@ -10,6 +10,7 @@ import {
 import { useProviderStats } from "@/lib/query/usage";
 import { fmtUsd } from "./format";
 import type { UsageRangeSelection } from "@/types/usage";
+import { cn } from "@/lib/utils";
 
 interface ProviderStatsTableProps {
   range: UsageRangeSelection;
@@ -49,6 +50,15 @@ export function ProviderStatsTable({
             <TableHead className="text-right">
               {t("usage.successRate", "成功率")}
             </TableHead>
+            <TableHead
+              className="text-right"
+              title={t(
+                "usage.cacheHitRateHint",
+                "缓存命中 tokens 占总 input tokens 的比例（成本视角）。公式按 app 类型不同：\nCodex: cache_read / input\nClaude: cache_read / (input + cache_read + cache_creation)",
+              )}
+            >
+              {t("usage.cacheHitRate", "缓存命中率")}
+            </TableHead>
             <TableHead className="text-right">
               {t("usage.avgLatency", "平均延迟")}
             </TableHead>
@@ -58,7 +68,7 @@ export function ProviderStatsTable({
           {stats?.length === 0 ? (
             <TableRow>
               <TableCell
-                colSpan={6}
+                colSpan={7}
                 className="text-center text-muted-foreground"
               >
                 {t("usage.noData", "暂无数据")}
@@ -66,7 +76,7 @@ export function ProviderStatsTable({
             </TableRow>
           ) : (
             stats?.map((stat) => (
-              <TableRow key={stat.providerId}>
+              <TableRow key={`${stat.appType}:${stat.providerId}`}>
                 <TableCell className="font-medium">
                   {stat.providerName}
                 </TableCell>
@@ -82,6 +92,14 @@ export function ProviderStatsTable({
                 <TableCell className="text-right">
                   {stat.successRate.toFixed(1)}%
                 </TableCell>
+                <TableCell
+                  className={cn(
+                    "text-right font-mono text-xs",
+                    cacheHitToneClass(stat.cacheHitRate),
+                  )}
+                >
+                  {formatCacheHit(stat.cacheHitRate)}
+                </TableCell>
                 <TableCell className="text-right">
                   {stat.avgLatencyMs}ms
                 </TableCell>
@@ -92,4 +110,18 @@ export function ProviderStatsTable({
       </Table>
     </div>
   );
+}
+
+/** 命中率 null（无样本）→ "—"；否则百分比保留 1 位小数 */
+function formatCacheHit(rate: number | null): string {
+  if (rate === null || Number.isNaN(rate)) return "—";
+  return `${(rate * 100).toFixed(1)}%`;
+}
+
+/** 命中率按阈值着色（绿≥70%, 黄 30-70%, 红<30%）*/
+function cacheHitToneClass(rate: number | null): string {
+  if (rate === null) return "text-muted-foreground";
+  if (rate >= 0.7) return "text-emerald-600 dark:text-emerald-400";
+  if (rate >= 0.3) return "text-amber-600 dark:text-amber-400";
+  return "text-red-600 dark:text-red-400";
 }

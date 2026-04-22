@@ -87,11 +87,24 @@ export interface DailyStats {
 export interface ProviderStats {
   providerId: string;
   providerName: string;
+  appType: string;
   requestCount: number;
   totalTokens: number;
   totalCost: string;
   successRate: number;
   avgLatencyMs: number;
+  /**
+   * 缓存命中率 [0, 1] 或 null（无 prompt token）
+   *
+   * 按 app_type 采用不同分母（与后端 input_tokens 语义一致）：
+   * - codex：cache_read / input_tokens（流式路径 input 已含 cached）
+   * - claude：cache_read / (input + cache_read + cache_creation)
+   * - 其他：cache_read / (input + cache_read)
+   */
+  cacheHitRate: number | null;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  inputTokens: number;
 }
 
 export interface ModelStats {

@@ -44,11 +44,25 @@ pub struct DailyStats {
 pub struct ProviderStats {
     pub provider_id: String,
     pub provider_name: String,
+    pub app_type: String,
     pub request_count: u64,
     pub total_tokens: u64,
     pub total_cost: String,
     pub success_rate: f32,
     pub avg_latency_ms: u64,
+    /// 缓存命中率（0.0 ~ 1.0），无输入 token 时为 `None`
+    ///
+    /// 按 `app_type` 采用不同口径（与 DB 层 `input_tokens` 语义一致）：
+    /// - Codex：`cache_read / input_tokens`（流式路径 input 已含 cached）
+    /// - Claude：`cache_read / (input + cache_read + cache_creation)`
+    /// - 其他：`cache_read / (input + cache_read)`
+    pub cache_hit_rate: Option<f32>,
+    /// 原始汇总：缓存命中 token 数（分子）
+    pub cache_read_tokens: u64,
+    /// 原始汇总：缓存写入 token 数（Claude 特有）
+    pub cache_creation_tokens: u64,
+    /// 原始汇总：input_tokens（语义随 app_type 不同，详见 `cache_hit_rate` 注释）
+    pub input_tokens: u64,
 }
 
 /// 模型统计
@@ -128,6 +142,34 @@ fn provider_name_coalesce(log_alias: &str, provider_alias: &str) -> String {
          WHEN '_gemini_session' THEN 'Gemini (Session)' \
          ELSE {log_alias}.provider_id END)"
     )
+}
+
+/// 按 app_type 语义计算缓存命中率
+///
+/// cc-switch 按 API 类型存储 `input_tokens` 语义不同：
+/// - **Codex**：流式路径下 `input_tokens` 已包含 cached（Codex CLI 绝大多数场景走流式）；
+///   分母用 `input_tokens` 单独。
+/// - **Claude**：`input_tokens` 为净 uncached；分母 = input + cache_read + cache_creation。
+/// - **Gemini / 其他**：目前无 prompt caching 语义，给个保守分母避免除零。
+///
+/// 返回 `None` 当分母为 0（没有可统计的 prompt token）。
+pub fn compute_cache_hit_rate(
+    app_type: &str,
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+) -> Option<f32> {
+    let denom: u64 = match app_type {
+        "codex" => input_tokens,
+        "claude" => input_tokens
+            .saturating_add(cache_read_tokens)
+            .saturating_add(cache_creation_tokens),
+        _ => input_tokens.saturating_add(cache_read_tokens),
+    };
+    if denom == 0 {
+        return None;
+    }
+    Some((cache_read_tokens as f64 / denom as f64) as f32)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -674,7 +716,10 @@ impl Database {
                 SUM(success_count) as success_count,
                 CASE WHEN SUM(request_count) > 0
                     THEN SUM(latency_sum) / SUM(request_count)
-                    ELSE 0 END as avg_latency
+                    ELSE 0 END as avg_latency,
+                SUM(input_tokens) as input_tokens,
+                SUM(cache_read_tokens) as cache_read_tokens,
+                SUM(cache_creation_tokens) as cache_creation_tokens
             FROM (
                 SELECT l.provider_id, l.app_type,
                     {detail_pname} as provider_name,
@@ -682,7 +727,10 @@ impl Database {
                     COALESCE(SUM(l.input_tokens + l.output_tokens), 0) as total_tokens,
                     COALESCE(SUM(CAST(l.total_cost_usd AS REAL)), 0) as total_cost,
                     COALESCE(SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300 THEN 1 ELSE 0 END), 0) as success_count,
-                    COALESCE(SUM(l.latency_ms), 0) as latency_sum
+                    COALESCE(SUM(l.latency_ms), 0) as latency_sum,
+                    COALESCE(SUM(l.input_tokens), 0) as input_tokens,
+                    COALESCE(SUM(l.cache_read_tokens), 0) as cache_read_tokens,
+                    COALESCE(SUM(l.cache_creation_tokens), 0) as cache_creation_tokens
                 FROM proxy_request_logs l
                 LEFT JOIN providers p ON l.provider_id = p.id AND l.app_type = p.app_type
                 {detail_where}
@@ -694,7 +742,10 @@ impl Database {
                     COALESCE(SUM(r.input_tokens + r.output_tokens), 0),
                     COALESCE(SUM(CAST(r.total_cost_usd AS REAL)), 0),
                     COALESCE(SUM(r.success_count), 0),
-                    COALESCE(SUM(r.avg_latency_ms * r.request_count), 0)
+                    COALESCE(SUM(r.avg_latency_ms * r.request_count), 0),
+                    COALESCE(SUM(r.input_tokens), 0),
+                    COALESCE(SUM(r.cache_read_tokens), 0),
+                    COALESCE(SUM(r.cache_creation_tokens), 0)
                 FROM usage_daily_rollups r
                 LEFT JOIN providers p2 ON r.provider_id = p2.id AND r.app_type = p2.app_type
                 {rollup_where}
@@ -717,14 +768,30 @@ impl Database {
                 0.0
             };
 
+            let app_type: String = row.get(1)?;
+            let input_tokens: i64 = row.get(8)?;
+            let cache_read_tokens: i64 = row.get(9)?;
+            let cache_creation_tokens: i64 = row.get(10)?;
+            let cache_hit_rate = compute_cache_hit_rate(
+                &app_type,
+                input_tokens.max(0) as u64,
+                cache_read_tokens.max(0) as u64,
+                cache_creation_tokens.max(0) as u64,
+            );
+
             Ok(ProviderStats {
                 provider_id: row.get(0)?,
                 provider_name: row.get(2)?,
+                app_type,
                 request_count: request_count as u64,
                 total_tokens: row.get::<_, i64>(4)? as u64,
                 total_cost: format!("{:.6}", row.get::<_, f64>(5)?),
                 success_rate,
                 avg_latency_ms: row.get::<_, f64>(7)? as u64,
+                cache_hit_rate,
+                cache_read_tokens: cache_read_tokens.max(0) as u64,
+                cache_creation_tokens: cache_creation_tokens.max(0) as u64,
+                input_tokens: input_tokens.max(0) as u64,
             })
         };
 
@@ -1342,6 +1409,34 @@ pub(crate) fn find_model_pricing_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_hit_rate_codex_uses_input_as_denominator() {
+        // Codex 流式：input_tokens 已包含 cached → 命中率 = cache_read / input
+        let rate = compute_cache_hit_rate("codex", 1000, 970, 0).unwrap();
+        assert!((rate - 0.97).abs() < 0.001, "expected ~97%, got {rate}");
+    }
+
+    #[test]
+    fn cache_hit_rate_claude_includes_cache_creation_in_denominator() {
+        // Claude：input=100（净 uncached），cache_read=900，cache_creation=200
+        //   命中率 = 900 / (100+900+200) = 75%
+        let rate = compute_cache_hit_rate("claude", 100, 900, 200).unwrap();
+        assert!((rate - 0.75).abs() < 0.001, "expected 75%, got {rate}");
+    }
+
+    #[test]
+    fn cache_hit_rate_unknown_app_type_uses_input_plus_cache_read() {
+        // 保守口径（当作 Codex 非流式）：分母 = input + cache_read
+        let rate = compute_cache_hit_rate("gemini", 100, 900, 0).unwrap();
+        assert!((rate - 0.9).abs() < 0.001, "expected 90%, got {rate}");
+    }
+
+    #[test]
+    fn cache_hit_rate_returns_none_when_denominator_zero() {
+        assert_eq!(compute_cache_hit_rate("codex", 0, 0, 0), None);
+        assert_eq!(compute_cache_hit_rate("claude", 0, 0, 0), None);
+    }
 
     fn local_ts(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> i64 {
         match Local.with_ymd_and_hms(year, month, day, hour, minute, second) {
