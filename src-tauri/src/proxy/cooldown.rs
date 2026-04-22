@@ -94,6 +94,38 @@ impl CooldownTracker {
             })
             .unwrap_or(0)
     }
+
+    /// 指定 app_type 的全部 provider 中，**最早解冻**所剩时间（毫秒）
+    ///
+    /// 仅在 `provider_ids` 全部都有冷却记录时有意义；调用方应保证传入的是
+    /// 当前 failover 队列的 provider 列表。
+    ///
+    /// - 返回 `Some(ms)`：全部都在冷却，`ms` 是最短剩余时间
+    /// - 返回 `None`：至少有一个 provider 已经不在冷却（表示现在就能选）
+    pub async fn earliest_remaining_ms_all(
+        &self,
+        app_type: &str,
+        provider_ids: &[String],
+    ) -> Option<u64> {
+        if provider_ids.is_empty() {
+            return None;
+        }
+        let now = Instant::now();
+        let states = self.states.read().await;
+        let mut earliest: Option<u64> = None;
+        for pid in provider_ids {
+            let key = make_key(app_type, pid);
+            match states.get(&key) {
+                Some(s) if s.cooldown_until > now => {
+                    let remain = (s.cooldown_until - now).as_millis() as u64;
+                    earliest = Some(earliest.map(|m| m.min(remain)).unwrap_or(remain));
+                }
+                // 只要有一个 provider 不在冷却（或从未记录过），就说明"现在就能选"
+                _ => return None,
+            }
+        }
+        earliest
+    }
 }
 
 fn make_key(app_type: &str, provider_id: &str) -> String {
@@ -201,5 +233,38 @@ mod tests {
     fn hint_caps_at_safe_max() {
         let ms = compute_cooldown_ms(1, Some(u64::MAX));
         assert!(ms <= HINT_MAX_MS);
+    }
+
+    #[tokio::test]
+    async fn earliest_remaining_none_when_any_is_free() {
+        let tracker = CooldownTracker::new();
+        tracker.record_failure("codex", "a", Some(5_000)).await;
+        // b 从未失败过 → 应认为"现在就能选"
+        let ids = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(tracker.earliest_remaining_ms_all("codex", &ids).await, None);
+    }
+
+    #[tokio::test]
+    async fn earliest_remaining_returns_min_when_all_cooling() {
+        let tracker = CooldownTracker::new();
+        tracker.record_failure("codex", "a", Some(5_000)).await;
+        tracker.record_failure("codex", "b", Some(2_000)).await;
+        tracker.record_failure("codex", "c", Some(3_000)).await;
+        let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let remain = tracker
+            .earliest_remaining_ms_all("codex", &ids)
+            .await
+            .expect("all cooling");
+        // 最短应在 b 的 2000ms 附近（允许小量抖动）
+        assert!(remain > 1_500 && remain <= 2_000, "got {remain}");
+    }
+
+    #[tokio::test]
+    async fn earliest_remaining_empty_input_returns_none() {
+        let tracker = CooldownTracker::new();
+        assert_eq!(
+            tracker.earliest_remaining_ms_all("codex", &[]).await,
+            None
+        );
     }
 }

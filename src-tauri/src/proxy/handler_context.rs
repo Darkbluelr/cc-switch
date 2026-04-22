@@ -133,17 +133,25 @@ impl RequestContext {
         } else {
             None
         };
-        let providers = state
+        let providers = match state
             .provider_router
             .select_providers(app_type_str, session_affinity_key)
             .await
-            .map_err(|e| match e {
-                crate::error::AppError::AllProvidersCircuitOpen => {
-                    ProxyError::AllProvidersCircuitOpen
-                }
-                crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
-                _ => ProxyError::DatabaseError(e.to_string()),
-            })?;
+        {
+            Ok(v) => v,
+            Err(crate::error::AppError::AllProvidersCircuitOpen) => {
+                // 查冷却剩余填入 Retry-After，让客户端知道冷却窗口再重试
+                let retry_after_ms = state
+                    .provider_router
+                    .earliest_cooldown_remaining_ms(app_type_str)
+                    .await;
+                return Err(ProxyError::AllProvidersCircuitOpen { retry_after_ms });
+            }
+            Err(crate::error::AppError::NoProvidersConfigured) => {
+                return Err(ProxyError::NoProvidersConfigured);
+            }
+            Err(e) => return Err(ProxyError::DatabaseError(e.to_string())),
+        };
 
         let provider = providers
             .first()

@@ -29,8 +29,12 @@ pub enum ProxyError {
     #[error("无可用的Provider")]
     NoAvailableProvider,
 
-    #[error("所有供应商已熔断，无可用渠道")]
-    AllProvidersCircuitOpen,
+    #[error("所有供应商暂不可用（全部处在冷却/熔断中）")]
+    AllProvidersCircuitOpen {
+        /// 最早解冻剩余时间（毫秒）。用于给客户端下发 `Retry-After` 头，
+        /// 避免客户端在冷却窗口内徒劳重试把自己的 retry budget 打光。
+        retry_after_ms: Option<u64>,
+    },
 
     #[error("未配置供应商")]
     NoProvidersConfigured,
@@ -84,6 +88,27 @@ pub enum ProxyError {
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
+        // AllProvidersCircuitOpen 也可能携带 Retry-After（来自路由器对冷却队列的汇总）
+        if let ProxyError::AllProvidersCircuitOpen { retry_after_ms } = &self {
+            let error_body = json!({
+                "error": {
+                    "message": self.to_string(),
+                    "type": "proxy_error",
+                }
+            });
+            let mut response =
+                (StatusCode::SERVICE_UNAVAILABLE, Json(error_body)).into_response();
+            if let Some(ms) = retry_after_ms {
+                let secs = (*ms as f64 / 1000.0).ceil().max(1.0) as u64;
+                if let Ok(val) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                    response
+                        .headers_mut()
+                        .insert(axum::http::header::RETRY_AFTER, val);
+                }
+            }
+            return response;
+        }
+
         let (status, body, retry_after_ms) = match &self {
             ProxyError::UpstreamError {
                 status: upstream_status,
@@ -135,9 +160,7 @@ impl IntoResponse for ProxyError {
                     ProxyError::NoAvailableProvider => {
                         (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
                     }
-                    ProxyError::AllProvidersCircuitOpen => {
-                        (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
-                    }
+                    ProxyError::AllProvidersCircuitOpen { .. } => unreachable!(),
                     ProxyError::NoProvidersConfigured => {
                         (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
                     }

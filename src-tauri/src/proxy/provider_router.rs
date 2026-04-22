@@ -79,6 +79,24 @@ impl ProviderRouter {
         self.cooldown.clear(app_type, provider_id).await;
     }
 
+    /// 当 failover 队列内全部 provider 都在冷却时，返回"最早解冻剩余时间"（毫秒）
+    ///
+    /// 用于把"所有供应商暂不可用"的 503 返回附带合理的 `Retry-After`，
+    /// 告诉客户端不用立刻重试，减少 CLI 端 retry budget 的无效消耗。
+    ///
+    /// - `Some(ms)`：队列非空且全部处在冷却中，`ms` 是最快解冻剩余时间
+    /// - `None`：队列为空 / 有可用候选 / 数据库查询失败 —— 不下发 Retry-After
+    pub async fn earliest_cooldown_remaining_ms(&self, app_type: &str) -> Option<u64> {
+        let ids: Vec<String> = self
+            .db
+            .get_failover_queue(app_type)
+            .ok()?
+            .into_iter()
+            .map(|item| item.provider_id)
+            .collect();
+        self.cooldown.earliest_remaining_ms_all(app_type, &ids).await
+    }
+
     /// 选择可用的供应商（支持故障转移 + 会话亲和 + Round-Robin）
     ///
     /// 返回按优先级排序的可用供应商列表：
