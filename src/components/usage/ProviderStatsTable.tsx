@@ -54,7 +54,17 @@ export function ProviderStatsTable({
               className="text-right"
               title={t(
                 "usage.cacheHitRateHint",
-                "缓存命中 tokens 占总 input tokens 的比例（成本视角）。公式按 app 类型不同：\nCodex: cache_read / input\nClaude: cache_read / (input + cache_read + cache_creation)",
+                [
+                  "按 token 加权的命中率：cache_read / 总 prompt tokens。",
+                  "这是业界惯例（Anthropic / OpenAI / LiteLLM 都这么算）。",
+                  "",
+                  "公式按 app 类型不同：",
+                  "  Codex:  cache_read / input_tokens（input 已含 cached）",
+                  "  Claude: cache_read / (input + cache_read + cache_creation)",
+                  "",
+                  "⚠ 不等于美元成本节省率 —— cache read 仍要计费（Claude 约 10%，OpenAI 约 50%），",
+                  "实际节省率 ≤ 本数值。",
+                ].join("\n"),
               )}
             >
               {t("usage.cacheHitRate", "缓存命中率")}

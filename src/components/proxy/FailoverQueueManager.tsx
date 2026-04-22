@@ -356,7 +356,11 @@ function ProviderMetricsBadges({
         tone={cacheHitTone(m.cacheHitRate)}
         title={t(
           "proxy.failoverQueue.metrics.cacheHitHint",
-          "越高越省输入 tokens；低于 20% 可能是该 provider 不做缓存",
+          [
+            "按 token 加权：cache_read / 总 prompt tokens。",
+            "用于横向对比 provider 的缓存行为（不是美元节省率）。",
+            "低于 20% 通常意味着该 provider 不做缓存，或 prompt 不利于缓存。",
+          ].join("\n"),
         )}
       />
       <MetricBadge
