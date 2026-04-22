@@ -103,6 +103,27 @@ export function useFailoverQueue(appType: string) {
 }
 
 /**
+ * Per-provider 健康度指标（缓存命中率 / 假 200 率 / TTFT）
+ *
+ * - 自动 15s 刷新一次，让用户能看到实时变化
+ * - 窗口默认 30 分钟，可由调用者覆盖
+ * - 返回的数组只包含窗口内有样本的 provider
+ */
+export function useProviderHealthMetrics(
+  appType: string,
+  windowSeconds?: number,
+) {
+  return useQuery({
+    queryKey: ["providerHealthMetrics", appType, windowSeconds ?? "default"],
+    queryFn: () => failoverApi.getProviderHealthMetrics(appType, windowSeconds),
+    enabled: !!appType,
+    refetchInterval: 15_000,
+    refetchOnWindowFocus: true,
+    staleTime: 5_000,
+  });
+}
+
+/**
  * 获取可添加到队列的供应商
  */
 export function useAvailableProvidersForFailover(appType: string) {

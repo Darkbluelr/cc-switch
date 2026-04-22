@@ -8,6 +8,7 @@ pub mod prompts;
 pub mod providers;
 pub mod providers_seed;
 pub mod proxy;
+pub mod proxy_metrics;
 pub mod settings;
 pub mod skills;
 pub mod stream_check;
@@ -17,3 +18,4 @@ pub mod usage_rollup;
 // 所有 DAO 方法都通过 Database impl 提供，无需单独导出
 // 导出 FailoverQueueItem 供外部使用
 pub use failover::FailoverQueueItem;
+pub use proxy_metrics::ProviderHealthMetrics;

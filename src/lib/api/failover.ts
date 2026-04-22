@@ -4,6 +4,7 @@ import type {
   CircuitBreakerConfig,
   CircuitBreakerStats,
   FailoverQueueItem,
+  ProviderHealthMetricsView,
 } from "@/types/proxy";
 
 export interface Provider {
@@ -95,5 +96,19 @@ export const failoverApi = {
     enabled: boolean,
   ): Promise<void> {
     return invoke("set_auto_failover_enabled", { appType, enabled });
+  },
+
+  // ========== Provider 健康度指标 ==========
+
+  /**
+   * 拉取指定 app_type 在最近 window_seconds 内的 per-provider 健康指标
+   * - 只返回有样本的 provider；队列里"最近无流量"的 provider 不会出现
+   * - window_seconds 省略默认 30 分钟；后端会 clamp 到 [60, 7*24*3600]
+   */
+  async getProviderHealthMetrics(
+    appType: string,
+    windowSeconds?: number,
+  ): Promise<ProviderHealthMetricsView[]> {
+    return invoke("get_provider_health_metrics", { appType, windowSeconds });
   },
 };

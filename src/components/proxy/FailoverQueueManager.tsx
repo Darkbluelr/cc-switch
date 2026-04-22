@@ -30,7 +30,9 @@ import {
   useRemoveFromFailoverQueue,
   useAutoFailoverEnabled,
   useSetAutoFailoverEnabled,
+  useProviderHealthMetrics,
 } from "@/lib/query/failover";
+import type { ProviderHealthMetricsView } from "@/types/proxy";
 
 interface FailoverQueueManagerProps {
   appType: AppId;
@@ -56,6 +58,12 @@ export function FailoverQueueManager({
   } = useFailoverQueue(appType);
   const { data: availableProviders, isLoading: isProvidersLoading } =
     useAvailableProvidersForFailover(appType);
+
+  // Per-provider 健康指标（默认 30 分钟窗口，15s 轮询刷新）
+  const { data: metricsList } = useProviderHealthMetrics(appType);
+  const metricsByProvider = new Map<string, ProviderHealthMetricsView>(
+    (metricsList ?? []).map((m) => [m.providerId, m]),
+  );
 
   // Mutations
   const addToQueue = useAddToFailoverQueue();
@@ -233,6 +241,7 @@ export function FailoverQueueManager({
               disabled={disabled}
               onRemove={handleRemoveProvider}
               isRemoving={removeFromQueue.isPending}
+              metrics={metricsByProvider.get(item.providerId)}
             />
           ))}
         </div>
@@ -257,6 +266,7 @@ interface QueueItemProps {
   disabled: boolean;
   onRemove: (providerId: string) => void;
   isRemoving: boolean;
+  metrics?: ProviderHealthMetricsView;
 }
 
 function QueueItem({
@@ -265,6 +275,7 @@ function QueueItem({
   disabled,
   onRemove,
   isRemoving,
+  metrics,
 }: QueueItemProps) {
   const { t } = useTranslation();
 
@@ -275,27 +286,30 @@ function QueueItem({
       )}
     >
       {/* 序号 */}
-      <div className="flex h-6 w-6 items-center justify-center rounded-full bg-muted text-xs font-medium">
+      <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-medium">
         {index + 1}
       </div>
 
-      {/* 供应商名称 */}
+      {/* 供应商名称 + 指标徽章 */}
       <div className="flex-1 min-w-0">
-        <span className="text-sm font-medium truncate block">
-          {item.providerName}
-          {item.providerNotes && (
-            <span className="ml-1 text-xs text-muted-foreground">
-              ({item.providerNotes})
-            </span>
-          )}
-        </span>
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-sm font-medium truncate">
+            {item.providerName}
+            {item.providerNotes && (
+              <span className="ml-1 text-xs text-muted-foreground">
+                ({item.providerNotes})
+              </span>
+            )}
+          </span>
+          <ProviderMetricsBadges metrics={metrics} />
+        </div>
       </div>
 
       {/* 删除按钮 */}
       <Button
         variant="ghost"
         size="icon"
-        className="h-8 w-8 text-muted-foreground hover:text-destructive"
+        className="h-8 w-8 shrink-0 text-muted-foreground hover:text-destructive"
         onClick={() => onRemove(item.providerId)}
         disabled={disabled || isRemoving}
         aria-label={t("common.delete", "删除")}
@@ -308,4 +322,136 @@ function QueueItem({
       </Button>
     </div>
   );
+}
+
+/**
+ * Provider 指标徽章：缓存命中率 / 假 200 率 / 首字节延迟
+ *
+ * 没有样本（`metrics` 为 undefined 或 totalRequests=0）时显示"—"占位，
+ * 避免 UI 里留白让用户误以为坏了。
+ */
+function ProviderMetricsBadges({
+  metrics,
+}: {
+  metrics?: ProviderHealthMetricsView;
+}) {
+  const { t } = useTranslation();
+
+  const hasData = !!metrics && metrics.totalRequests > 0;
+
+  if (!hasData) {
+    return (
+      <span className="text-[10px] text-muted-foreground/70 font-mono">
+        {t("proxy.failoverQueue.metrics.noData", "暂无近 30 分钟样本")}
+      </span>
+    );
+  }
+
+  const m = metrics!;
+  return (
+    <div className="flex items-center gap-1 flex-wrap">
+      <MetricBadge
+        label={t("proxy.failoverQueue.metrics.cacheHit", "缓存命中")}
+        value={formatPercent(m.cacheHitRate)}
+        tone={cacheHitTone(m.cacheHitRate)}
+        title={t(
+          "proxy.failoverQueue.metrics.cacheHitHint",
+          "越高越省输入 tokens；低于 20% 可能是该 provider 不做缓存",
+        )}
+      />
+      <MetricBadge
+        label={t("proxy.failoverQueue.metrics.fake200", "断流率")}
+        value={formatPercent(m.fake200Rate)}
+        tone={fake200Tone(m.fake200Rate)}
+        title={t(
+          "proxy.failoverQueue.metrics.fake200Hint",
+          "流式 200 响应里没有终止事件的比例；过高说明上游在中途关流",
+        )}
+      />
+      <MetricBadge
+        label="TTFT"
+        value={formatTtft(m.avgFirstTokenMs)}
+        tone={ttftTone(m.avgFirstTokenMs)}
+        title={t(
+          "proxy.failoverQueue.metrics.ttftHint",
+          "平均首字节延迟；数值偏大说明该 provider 响应慢",
+        )}
+      />
+      <span
+        className="text-[10px] text-muted-foreground/60 font-mono"
+        title={t(
+          "proxy.failoverQueue.metrics.sampleSizeHint",
+          "最近 30 分钟内的成功 + 失败请求总数",
+        )}
+      >
+        n={m.totalRequests}
+      </span>
+    </div>
+  );
+}
+
+type Tone = "good" | "warn" | "bad" | "neutral";
+
+function MetricBadge({
+  label,
+  value,
+  tone,
+  title,
+}: {
+  label: string;
+  value: string;
+  tone: Tone;
+  title?: string;
+}) {
+  const toneClass = {
+    good: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
+    warn: "bg-amber-500/15 text-amber-600 dark:text-amber-400",
+    bad: "bg-red-500/15 text-red-600 dark:text-red-400",
+    neutral: "bg-muted text-muted-foreground",
+  }[tone];
+
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] font-mono",
+        toneClass,
+      )}
+      title={title}
+    >
+      <span className="opacity-70">{label}</span>
+      <span className="font-medium">{value}</span>
+    </span>
+  );
+}
+
+function formatPercent(rate: number | null): string {
+  if (rate === null || Number.isNaN(rate)) return "—";
+  return `${(rate * 100).toFixed(1)}%`;
+}
+
+function formatTtft(ms: number | null): string {
+  if (ms === null) return "—";
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function cacheHitTone(rate: number | null): Tone {
+  if (rate === null) return "neutral";
+  if (rate >= 0.7) return "good";
+  if (rate >= 0.3) return "warn";
+  return "bad";
+}
+
+function fake200Tone(rate: number | null): Tone {
+  if (rate === null) return "neutral";
+  if (rate <= 0.02) return "good";
+  if (rate <= 0.1) return "warn";
+  return "bad";
+}
+
+function ttftTone(ms: number | null): Tone {
+  if (ms === null) return "neutral";
+  if (ms <= 2000) return "good";
+  if (ms <= 5000) return "warn";
+  return "bad";
 }

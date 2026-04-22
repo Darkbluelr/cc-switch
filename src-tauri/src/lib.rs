@@ -1182,6 +1182,8 @@ pub fn run() {
             commands::remove_from_failover_queue,
             commands::get_auto_failover_enabled,
             commands::set_auto_failover_enabled,
+            // Per-provider health metrics (cache hit / fake-200 / TTFT)
+            commands::get_provider_health_metrics,
             // Usage statistics
             commands::get_usage_summary,
             commands::get_usage_trends,

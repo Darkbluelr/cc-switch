@@ -113,6 +113,37 @@ export interface FailoverQueueItem {
   sortIndex?: number;
 }
 
+/**
+ * Per-provider 健康度指标（最近 N 秒的聚合）
+ *
+ * 缓存命中率分母按 app_type 语义计算：
+ * - Codex 流式：input_tokens（已包含 cached）
+ * - Codex 非流式：input_tokens + cache_read_tokens
+ * - Claude：input_tokens + cache_read_tokens + cache_creation_tokens
+ */
+export interface ProviderHealthMetricsView {
+  providerId: string;
+  appType: string;
+  /** 采样窗口（秒）*/
+  windowSeconds: number;
+  totalRequests: number;
+  successCount: number;
+  errorCount: number;
+  /** 假 200：流式 200 + 三类 token 全 0 */
+  fake200Count: number;
+  streaming200Count: number;
+  cacheReadTokens: number;
+  promptTotalTokens: number;
+  /** [0, 1] 或 null（无样本）*/
+  successRate: number | null;
+  /** [0, 1] 或 null（无流式 200 样本）*/
+  fake200Rate: number | null;
+  /** [0, 1] 或 null（无 prompt token）*/
+  cacheHitRate: number | null;
+  avgFirstTokenMs: number | null;
+  maxFirstTokenMs: number | null;
+}
+
 // 全局代理配置（统一字段，三行镜像）
 export interface GlobalProxyConfig {
   proxyEnabled: boolean;
