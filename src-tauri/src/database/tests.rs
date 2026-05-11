@@ -184,6 +184,62 @@ fn schema_migration_rejects_future_version() {
 }
 
 #[test]
+fn schema_migration_upgrades_v9_to_v10() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+
+    conn.execute(
+        "CREATE TABLE mcp_servers (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, server_config TEXT NOT NULL,
+            description TEXT, homepage TEXT, docs TEXT, tags TEXT NOT NULL DEFAULT '[]',
+            enabled_claude BOOLEAN NOT NULL DEFAULT 0, enabled_codex BOOLEAN NOT NULL DEFAULT 0,
+            enabled_gemini BOOLEAN NOT NULL DEFAULT 0, enabled_opencode BOOLEAN NOT NULL DEFAULT 0
+        )",
+        [],
+    )
+    .expect("create v9 mcp_servers");
+
+    conn.execute(
+        "CREATE TABLE skills (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            directory TEXT NOT NULL,
+            repo_owner TEXT,
+            repo_name TEXT,
+            repo_branch TEXT DEFAULT 'main',
+            readme_url TEXT,
+            enabled_claude BOOLEAN NOT NULL DEFAULT 0,
+            enabled_codex BOOLEAN NOT NULL DEFAULT 0,
+            enabled_gemini BOOLEAN NOT NULL DEFAULT 0,
+            enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
+            installed_at INTEGER NOT NULL DEFAULT 0,
+            content_hash TEXT,
+            updated_at INTEGER NOT NULL DEFAULT 0
+        )",
+        [],
+    )
+    .expect("create v9 skills");
+
+    Database::set_user_version(&conn, 9).expect("set user_version=9");
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply v9->v10 migration");
+
+    assert!(
+        Database::has_column(&conn, "mcp_servers", "enabled_hermes")
+            .expect("check mcp_servers.enabled_hermes"),
+        "mcp_servers.enabled_hermes should exist after migration"
+    );
+    assert!(
+        Database::has_column(&conn, "skills", "enabled_hermes")
+            .expect("check skills.enabled_hermes"),
+        "skills.enabled_hermes should exist after migration"
+    );
+    assert_eq!(
+        Database::get_user_version(&conn).expect("version after migration"),
+        SCHEMA_VERSION
+    );
+}
+
+#[test]
 fn schema_migration_adds_missing_columns_for_providers() {
     let conn = Connection::open_in_memory().expect("open memory db");
 
