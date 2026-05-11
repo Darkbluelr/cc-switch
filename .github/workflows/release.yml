@@ -87,50 +87,19 @@ jobs:
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
-      - name: Prepare Tauri signing key
+      - name: Disable updater signing artifacts in CI release
         shell: bash
         run: |
           set -euo pipefail
-          # 在工作区写入密钥，避免 Windows 下 RUNNER_TEMP 路径风格差异
-          KEY_PATH="$PWD/.tauri-signing.key"
-          RAW="${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}"
-          if [ -n "$RAW" ]; then
-            # 情况 1：原始两行文本（第一行以 "untrusted comment:" 开头）
-            if echo "$RAW" | head -n1 | grep -q '^untrusted comment:'; then
-              printf '%s\n' "$RAW" > "$KEY_PATH"
-              echo "✅ 使用原始两行密钥文件格式"
-            # 情况 2：整体被 base64 包裹（解包后应当是两行）
-            elif DECODED=$(printf '%s' "$RAW" | (base64 --decode 2>/dev/null || base64 -D 2>/dev/null)) \
-              && echo "$DECODED" | head -n1 | grep -q '^untrusted comment:'; then
-              printf '%s\n' "$DECODED" > "$KEY_PATH"
-              echo "✅ 成功解码 base64 包裹密钥，已还原为两行文件"
-            # 情况 3：已是第二行（纯 Base64 一行）→ 构造两行文件
-            elif echo "$RAW" | grep -Eq '^[A-Za-z0-9+/=]+$'; then
-              ONE=$(printf '%s' "$RAW" | tr -d '\r\n')
-              printf '%s\n%s\n' "untrusted comment: tauri signing key" "$ONE" > "$KEY_PATH"
-              echo "✅ 使用一行 Base64 私钥，已构造两行文件"
-            else
-              echo "❌ TAURI_SIGNING_PRIVATE_KEY 格式无法识别：既不是两行原文，也不是其 base64，亦非一行 base64" >&2
-              echo "密钥前10个字符: $(echo "$RAW" | head -c 10)..." >&2
-              exit 1
-            fi
-          else
-            echo "⚠️ TAURI_SIGNING_PRIVATE_KEY 未配置，生成临时签名密钥（仅用于本次构建）"
-            pnpm tauri signer generate --ci -w "$KEY_PATH" --force
-          fi
-
-          if [ ! -s "$KEY_PATH" ]; then
-            echo "❌ 未能写入有效的 Tauri 私钥文件: $KEY_PATH" >&2
-            exit 1
-          fi
-
-          # Tauri 支持这里传“路径”或“密钥文本”，统一传路径避免换行/编码差异
-          echo "TAURI_SIGNING_PRIVATE_KEY=$KEY_PATH" >> "$GITHUB_ENV"
-          echo "TAURI_SIGNING_PRIVATE_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
-          if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" ]; then
-            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" >> $GITHUB_ENV
-          fi
-          echo "✅ Tauri signing key prepared"
+          node <<'NODE'
+          const fs = require("fs");
+          const path = "src-tauri/tauri.conf.json";
+          const config = JSON.parse(fs.readFileSync(path, "utf8"));
+          config.bundle = config.bundle || {};
+          config.bundle.createUpdaterArtifacts = false;
+          fs.writeFileSync(path, JSON.stringify(config, null, 2) + "\n");
+          NODE
+          echo "✅ bundle.createUpdaterArtifacts set to false for this CI build"
 
       - name: Import Apple signing certificate
         if: runner.os == 'macOS'
