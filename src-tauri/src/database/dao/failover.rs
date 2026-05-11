@@ -16,6 +16,7 @@ pub struct FailoverQueueItem {
     pub sort_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_notes: Option<String>,
+    pub failover_tier: usize,
 }
 
 impl Database {
@@ -25,10 +26,10 @@ impl Database {
 
         let mut stmt = conn
             .prepare(
-                "SELECT id, name, sort_index, notes
+                "SELECT id, name, sort_index, notes, failover_tier
                  FROM providers
                  WHERE app_type = ?1 AND in_failover_queue = 1
-                 ORDER BY COALESCE(sort_index, 999999), id ASC",
+                 ORDER BY failover_tier ASC, COALESCE(sort_index, 999999), id ASC",
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -39,6 +40,7 @@ impl Database {
                     provider_name: row.get(1)?,
                     sort_index: row.get(2)?,
                     provider_notes: row.get(3)?,
+                    failover_tier: row.get(4)?,
                 })
             })
             .map_err(|e| AppError::Database(e.to_string()))?
@@ -67,6 +69,29 @@ impl Database {
         conn.execute(
             "UPDATE providers SET in_failover_queue = 1 WHERE id = ?1 AND app_type = ?2",
             rusqlite::params![provider_id, app_type],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// 设置供应商的故障转移优先级梯度（1=最优先）
+    pub fn set_failover_tier(
+        &self,
+        app_type: &str,
+        provider_id: &str,
+        tier: usize,
+    ) -> Result<(), AppError> {
+        if !(1..=9).contains(&tier) {
+            return Err(AppError::InvalidInput(format!(
+                "failoverTier must be between 1 and 9 (got {tier})"
+            )));
+        }
+
+        let conn = lock_conn!(self.conn);
+        conn.execute(
+            "UPDATE providers SET failover_tier = ?1 WHERE id = ?2 AND app_type = ?3",
+            rusqlite::params![tier as i64, provider_id, app_type],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
 

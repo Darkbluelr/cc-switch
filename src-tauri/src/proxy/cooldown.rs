@@ -146,8 +146,10 @@ fn compute_cooldown_ms(consecutive_failures: u32, hint_ms: Option<u64>) -> u64 {
         .saturating_mul(1u64 << exp)
         .min(DEFAULT_MAX_COOLDOWN_MS);
     let jitter = 0.5 + 0.5 * jitter_unit_f64();
-    ((ideal as f64) * jitter)
-        .clamp(DEFAULT_BASE_COOLDOWN_MS as f64, DEFAULT_MAX_COOLDOWN_MS as f64) as u64
+    ((ideal as f64) * jitter).clamp(
+        DEFAULT_BASE_COOLDOWN_MS as f64,
+        DEFAULT_MAX_COOLDOWN_MS as f64,
+    ) as u64
 }
 
 /// 解析 `Retry-After` 头，支持整数秒或 HTTP-date 格式
@@ -262,9 +264,6 @@ mod tests {
     #[tokio::test]
     async fn earliest_remaining_empty_input_returns_none() {
         let tracker = CooldownTracker::new();
-        assert_eq!(
-            tracker.earliest_remaining_ms_all("codex", &[]).await,
-            None
-        );
+        assert_eq!(tracker.earliest_remaining_ms_all("codex", &[]).await, None);
     }
 }

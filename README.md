@@ -394,7 +394,10 @@ pnpm test:unit:watch
 pnpm build
 
 # Build debug version
-pnpm tauri build --debug
+pnpm build -- --debug
+
+# Build release (create updater artifacts; requires TAURI_SIGNING_PRIVATE_KEY)
+pnpm build:release
 ```
 
 ### Rust Backend Development

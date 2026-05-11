@@ -3,12 +3,13 @@
 //! 提供支持全局代理配置的 HTTP 客户端。
 //! 所有需要发送 HTTP 请求的模块都应使用此模块提供的客户端。
 
+use http::header::HeaderValue;
 use once_cell::sync::OnceCell;
 use reqwest::Client;
 use std::env;
 use std::net::IpAddr;
 use std::sync::RwLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 全局 HTTP 客户端实例
 static GLOBAL_CLIENT: OnceCell<RwLock<Client>> = OnceCell::new();
@@ -16,8 +17,16 @@ static GLOBAL_CLIENT: OnceCell<RwLock<Client>> = OnceCell::new();
 /// 当前代理 URL（用于日志和状态查询）
 static CURRENT_PROXY_URL: OnceCell<RwLock<Option<String>>> = OnceCell::new();
 
+/// 当前系统代理指纹（仅在未配置显式代理时使用，用于检测运行时系统代理变化）
+static SYSTEM_PROXY_FINGERPRINT: OnceCell<RwLock<String>> = OnceCell::new();
+
+/// 上次检查系统代理变化时间（节流用）
+static LAST_SYSTEM_PROXY_CHECK_AT: OnceCell<RwLock<Instant>> = OnceCell::new();
+
 /// CC Switch 代理服务器当前监听的端口
 static CC_SWITCH_PROXY_PORT: OnceCell<RwLock<u16>> = OnceCell::new();
+
+const SYSTEM_PROXY_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 
 /// 设置 CC Switch 代理服务器的监听端口
 ///
@@ -68,6 +77,7 @@ pub fn init(proxy_url: Option<&str>) -> Result<(), String> {
 
     // 初始化代理 URL 记录
     let _ = CURRENT_PROXY_URL.set(RwLock::new(effective_url.map(|s| s.to_string())));
+    init_system_proxy_fingerprint(effective_url.is_none());
 
     log::info!(
         "[GlobalProxy] Initialized: {}",
@@ -127,6 +137,7 @@ pub fn apply_proxy(proxy_url: Option<&str>) -> Result<(), String> {
         })?;
         *url = effective_url.map(|s| s.to_string());
     }
+    init_system_proxy_fingerprint(effective_url.is_none());
 
     log::info!(
         "[GlobalProxy] Applied: {}",
@@ -186,6 +197,7 @@ pub fn update_proxy(proxy_url: Option<&str>) -> Result<(), String> {
 ///
 /// 返回配置了代理的客户端（如果已配置代理），否则返回跟随系统代理的客户端。
 pub fn get() -> Client {
+    maybe_refresh_for_system_proxy_change();
     GLOBAL_CLIENT
         .get()
         .and_then(|lock| lock.read().ok())
@@ -204,6 +216,52 @@ pub fn get_current_proxy_url() -> Option<String> {
         .get()
         .and_then(|lock| lock.read().ok())
         .and_then(|url| url.clone())
+}
+
+/// 当前请求应使用的“有效上游代理”配置。
+///
+/// - 若用户在 CC Switch 内显式配置了代理，则优先使用显式代理。
+/// - 否则跟随系统代理（环境变量 + OS 系统代理），并在检测到系统代理指向
+///   CC Switch 自身端口时自动忽略，避免递归代理导致请求卡死/失败。
+#[derive(Clone, Debug)]
+pub struct EffectiveUpstreamProxy {
+    pub url: String,
+    pub basic_auth: Option<HeaderValue>,
+}
+
+/// 获取当前请求的“有效上游代理”。
+///
+/// 该函数用于转发链路（hyper raw write）选择上游代理：
+/// - 显式代理（UI 配置）优先
+/// - 否则跟随系统代理（例如 Clash/VPN 全局代理模式）
+pub fn get_effective_upstream_proxy(dst: &http::Uri) -> Option<EffectiveUpstreamProxy> {
+    if let Some(explicit) = get_current_proxy_url() {
+        return Some(EffectiveUpstreamProxy {
+            url: explicit,
+            basic_auth: None,
+        });
+    }
+
+    // Keep runtime system-proxy hot-reload working even when the forwarding
+    // path doesn't use reqwest. This also refreshes TLS roots on proxy changes.
+    maybe_refresh_for_system_proxy_change();
+
+    let matcher = hyper_util::client::proxy::matcher::Matcher::from_system();
+    let intercept = matcher.intercept(dst)?;
+
+    let proxy_url = intercept.uri().to_string();
+    if proxy_points_to_loopback(&proxy_url) {
+        log::warn!(
+            "[GlobalProxy] System proxy points to CC Switch itself ({}), ignoring to avoid recursion",
+            mask_url(&proxy_url)
+        );
+        return None;
+    }
+
+    Some(EffectiveUpstreamProxy {
+        url: proxy_url,
+        basic_auth: intercept.basic_auth().cloned(),
+    })
 }
 
 /// 检查是否正在使用代理
@@ -260,6 +318,106 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
     builder
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))
+}
+
+fn init_system_proxy_fingerprint(following_system_proxy: bool) {
+    let fingerprint = if following_system_proxy {
+        compute_system_proxy_fingerprint()
+    } else {
+        String::new()
+    };
+
+    if let Some(lock) = SYSTEM_PROXY_FINGERPRINT.get() {
+        if let Ok(mut fp) = lock.write() {
+            *fp = fingerprint;
+        }
+    } else {
+        let _ = SYSTEM_PROXY_FINGERPRINT.set(RwLock::new(fingerprint));
+    }
+
+    if LAST_SYSTEM_PROXY_CHECK_AT.get().is_none() {
+        let _ = LAST_SYSTEM_PROXY_CHECK_AT.set(RwLock::new(Instant::now()));
+    }
+}
+
+fn compute_system_proxy_fingerprint() -> String {
+    // NOTE: This reads both env proxy variables and OS-level system proxy settings
+    // (on supported platforms) via hyper-util.
+    let matcher = hyper_util::client::proxy::matcher::Matcher::from_system();
+
+    let http_dst = http::Uri::from_static("http://example.com/");
+    let https_dst = http::Uri::from_static("https://example.com/");
+
+    let http_proxy = matcher
+        .intercept(&http_dst)
+        .map(|i| mask_url(i.uri().to_string().as_str()))
+        .unwrap_or_default();
+    let https_proxy = matcher
+        .intercept(&https_dst)
+        .map(|i| mask_url(i.uri().to_string().as_str()))
+        .unwrap_or_default();
+
+    format!("http={http_proxy};https={https_proxy}")
+}
+
+fn maybe_refresh_for_system_proxy_change() {
+    // Only meaningful when we're in "follow system proxy" mode (no explicit proxy URL configured).
+    if get_current_proxy_url().is_some() {
+        return;
+    }
+
+    let now = Instant::now();
+    let should_check = match LAST_SYSTEM_PROXY_CHECK_AT.get() {
+        Some(lock) => match lock.read() {
+            Ok(last) => now.duration_since(*last) >= SYSTEM_PROXY_CHECK_INTERVAL,
+            Err(_) => false,
+        },
+        None => true,
+    };
+    if !should_check {
+        return;
+    }
+
+    // Update last check timestamp early to avoid stampedes under high concurrency.
+    if let Some(lock) = LAST_SYSTEM_PROXY_CHECK_AT.get() {
+        if let Ok(mut last) = lock.write() {
+            *last = now;
+        }
+    } else {
+        let _ = LAST_SYSTEM_PROXY_CHECK_AT.set(RwLock::new(now));
+    }
+
+    let new_fp = compute_system_proxy_fingerprint();
+    let old_fp = SYSTEM_PROXY_FINGERPRINT
+        .get()
+        .and_then(|lock| lock.read().ok().map(|fp| fp.clone()))
+        .unwrap_or_default();
+
+    if new_fp == old_fp {
+        return;
+    }
+
+    log::info!(
+        "[GlobalProxy] System proxy changed, rebuilding HTTP client (old='{}', new='{}')",
+        old_fp,
+        new_fp
+    );
+
+    match build_client(None) {
+        Ok(new_client) => {
+            if let Some(lock) = GLOBAL_CLIENT.get() {
+                if let Ok(mut client) = lock.write() {
+                    *client = new_client;
+                }
+            }
+            init_system_proxy_fingerprint(true);
+            // Also refresh TLS connector so newly-installed proxy CAs are picked up without restart.
+            let _ = super::hyper_client::refresh_tls_connector("system proxy changed");
+        }
+        Err(e) => {
+            log::warn!("[GlobalProxy] Failed to rebuild client after system proxy change: {e}");
+        }
+    }
 }
 
 fn system_proxy_points_to_loopback() -> bool {

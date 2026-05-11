@@ -787,6 +787,20 @@ impl RequestForwarder {
 
         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
         let mut mapped_body = normalize_thinking_type(mapped_body);
+        if adapter.name() == "Codex" {
+            let normalization =
+                super::openai_param_normalizer::normalize_openai_response_params(
+                    &mut mapped_body,
+                );
+            if normalization.applied {
+                log::info!(
+                    "[Codex] 归一化 {} 的 text.verbosity: {:?} -> {:?}",
+                    normalization.model.as_deref().unwrap_or("<unknown>"),
+                    normalization.text_verbosity_before,
+                    normalization.text_verbosity_after
+                );
+            }
+        }
 
         // 确定有效端点
         // GitHub Copilot API 使用 /chat/completions（无 /v1 前缀）
@@ -1381,18 +1395,19 @@ impl RequestForwarder {
             self.non_streaming_timeout
         };
 
-        // 获取全局代理 URL
-        let upstream_proxy_url: Option<String> = super::http_client::get_current_proxy_url();
+        let uri: http::Uri = url
+            .parse()
+            .map_err(|e| ProxyError::ForwardFailed(format!("Invalid URL '{url}': {e}")))?;
+
+        // 获取有效上游代理（显式配置优先，否则跟随系统代理）
+        let upstream_proxy = super::http_client::get_effective_upstream_proxy(&uri);
+        let upstream_proxy_url = upstream_proxy.as_ref().map(|p| p.url.clone());
 
         // SOCKS5 代理不支持 CONNECT 隧道，需要用 reqwest
         let is_socks_proxy = upstream_proxy_url
             .as_deref()
             .map(|u| u.starts_with("socks5"))
             .unwrap_or(false);
-
-        let uri: http::Uri = url
-            .parse()
-            .map_err(|e| ProxyError::ForwardFailed(format!("Invalid URL '{url}': {e}")))?;
 
         // 发送请求
         let response = if is_socks_proxy {
@@ -1427,6 +1442,7 @@ impl RequestForwarder {
                 body_bytes,
                 timeout,
                 upstream_proxy_url.as_deref(),
+                upstream_proxy.as_ref().and_then(|p| p.basic_auth.as_ref()),
             )
             .await?
         };
@@ -1439,8 +1455,7 @@ impl RequestForwarder {
         } else {
             let status_code = status.as_u16();
             // 先提取 Retry-After 头（body() 会消费 response）
-            let retry_after_ms =
-                super::cooldown::parse_retry_after_ms(response.headers());
+            let retry_after_ms = super::cooldown::parse_retry_after_ms(response.headers());
             let body_text = String::from_utf8(response.bytes().await?.to_vec()).ok();
 
             Err(ProxyError::UpstreamError {
@@ -1547,9 +1562,7 @@ fn extract_error_message(error: &ProxyError) -> Option<String> {
 /// 提取上游 `Retry-After` 建议（毫秒），供短冷却使用
 fn extract_retry_after_ms(error: &ProxyError) -> Option<u64> {
     match error {
-        ProxyError::UpstreamError {
-            retry_after_ms, ..
-        } => *retry_after_ms,
+        ProxyError::UpstreamError { retry_after_ms, .. } => *retry_after_ms,
         _ => None,
     }
 }
@@ -2113,6 +2126,7 @@ mod tests {
             icon: None,
             icon_color: None,
             in_failover_queue: false,
+            failover_tier: 1,
         };
 
         let is_copilot = provider
@@ -2158,6 +2172,7 @@ mod tests {
             icon: None,
             icon_color: None,
             in_failover_queue: false,
+            failover_tier: 1,
         };
 
         let enterprise_base_url = "https://copilot-api.corp.example.com";

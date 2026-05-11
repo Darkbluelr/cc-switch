@@ -5,6 +5,10 @@ use std::collections::HashMap;
 
 // SSOT 模式：不再写供应商副本文件
 
+fn default_failover_tier() -> usize {
+    1
+}
+
 /// 供应商结构体
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
@@ -40,6 +44,10 @@ pub struct Provider {
     #[serde(default)]
     #[serde(rename = "inFailoverQueue")]
     pub in_failover_queue: bool,
+    /// 故障转移优先级梯度（1=最优先）
+    #[serde(default = "default_failover_tier")]
+    #[serde(rename = "failoverTier")]
+    pub failover_tier: usize,
 }
 
 impl Provider {
@@ -63,6 +71,7 @@ impl Provider {
             icon: None,
             icon_color: None,
             in_failover_queue: false,
+            failover_tier: default_failover_tier(),
         }
     }
 }
@@ -488,6 +497,7 @@ impl UniversalProvider {
             icon: self.icon.clone(),
             icon_color: self.icon_color.clone(),
             in_failover_queue: false,
+            failover_tier: 1,
         })
     }
 
@@ -553,6 +563,7 @@ requires_openai_auth = true"#
             icon: self.icon.clone(),
             icon_color: self.icon_color.clone(),
             in_failover_queue: false,
+            failover_tier: 1,
         })
     }
 
@@ -588,6 +599,7 @@ requires_openai_auth = true"#
             icon: self.icon.clone(),
             icon_color: self.icon_color.clone(),
             in_failover_queue: false,
+            failover_tier: 1,
         })
     }
 }

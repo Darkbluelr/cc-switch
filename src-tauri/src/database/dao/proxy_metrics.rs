@@ -273,8 +273,32 @@ mod tests {
         {
             let conn = db.conn.lock().unwrap();
             // Codex 流式：input=1000（已含 cached），cache_read=970 → 命中率 97%
-            insert_log(&conn, "p1", "codex", 200, true, 1000, 970, 0, 50, Some(500), t);
-            insert_log(&conn, "p1", "codex", 200, true, 2000, 1940, 0, 100, Some(600), t);
+            insert_log(
+                &conn,
+                "p1",
+                "codex",
+                200,
+                true,
+                1000,
+                970,
+                0,
+                50,
+                Some(500),
+                t,
+            );
+            insert_log(
+                &conn,
+                "p1",
+                "codex",
+                200,
+                true,
+                2000,
+                1940,
+                0,
+                100,
+                Some(600),
+                t,
+            );
         }
 
         let metrics = db.get_provider_health_metrics("codex", 300).unwrap();
@@ -296,7 +320,19 @@ mod tests {
             let conn = db.conn.lock().unwrap();
             // Claude：input=100（净 uncached），cache_read=900，cache_creation=200
             //   → 分母 = 100+900+200 = 1200，命中率 = 900/1200 = 75%
-            insert_log(&conn, "p1", "claude", 200, true, 100, 900, 200, 50, Some(400), t);
+            insert_log(
+                &conn,
+                "p1",
+                "claude",
+                200,
+                true,
+                100,
+                900,
+                200,
+                50,
+                Some(400),
+                t,
+            );
         }
 
         let metrics = db.get_provider_health_metrics("claude", 300).unwrap();
@@ -315,7 +351,19 @@ mod tests {
         {
             let conn = db.conn.lock().unwrap();
             // 正常 200 流式
-            insert_log(&conn, "p1", "codex", 200, true, 1000, 900, 0, 100, Some(500), t);
+            insert_log(
+                &conn,
+                "p1",
+                "codex",
+                200,
+                true,
+                1000,
+                900,
+                0,
+                100,
+                Some(500),
+                t,
+            );
             // 假 200（所有 token 都是 0）
             insert_log(&conn, "p1", "codex", 200, true, 0, 0, 0, 0, Some(30000), t);
             // 非流式 200 即便 0 token 也不算假 200
@@ -342,7 +390,19 @@ mod tests {
         let t = now();
         {
             let conn = db.conn.lock().unwrap();
-            insert_log(&conn, "p1", "codex", 200, true, 100, 90, 0, 10, Some(100), t);
+            insert_log(
+                &conn,
+                "p1",
+                "codex",
+                200,
+                true,
+                100,
+                90,
+                0,
+                10,
+                Some(100),
+                t,
+            );
             // 2 小时前（窗口 30min 应该看不到）
             insert_log(
                 &conn,
@@ -382,14 +442,46 @@ mod tests {
         {
             let conn = db.conn.lock().unwrap();
             // 真实代理记录
-            insert_log(&conn, "p1", "codex", 200, true, 1000, 900, 0, 100, Some(500), t);
+            insert_log(
+                &conn,
+                "p1",
+                "codex",
+                200,
+                true,
+                1000,
+                900,
+                0,
+                100,
+                Some(500),
+                t,
+            );
             // session_log 同一请求的"镜像"记录（占位 provider_id，0 tokens 是常见情况）
             insert_log_with_source(
-                &conn, "_codex_session", "codex", 200, true, 0, 0, 0, 0, None, t,
+                &conn,
+                "_codex_session",
+                "codex",
+                200,
+                true,
+                0,
+                0,
+                0,
+                0,
+                None,
+                t,
                 "session_log",
             );
             insert_log_with_source(
-                &conn, "p1", "codex", 200, true, 500, 400, 0, 50, Some(300), t,
+                &conn,
+                "p1",
+                "codex",
+                200,
+                true,
+                500,
+                400,
+                0,
+                50,
+                Some(300),
+                t,
                 "session_log",
             );
         }
@@ -410,8 +502,32 @@ mod tests {
         let t = now();
         {
             let conn = db.conn.lock().unwrap();
-            insert_log(&conn, "p1", "codex", 200, true, 100, 90, 0, 10, Some(1000), t);
-            insert_log(&conn, "p1", "codex", 200, true, 100, 90, 0, 10, Some(3000), t);
+            insert_log(
+                &conn,
+                "p1",
+                "codex",
+                200,
+                true,
+                100,
+                90,
+                0,
+                10,
+                Some(1000),
+                t,
+            );
+            insert_log(
+                &conn,
+                "p1",
+                "codex",
+                200,
+                true,
+                100,
+                90,
+                0,
+                10,
+                Some(3000),
+                t,
+            );
             insert_log(&conn, "p1", "codex", 200, true, 100, 90, 0, 10, None, t);
         }
 

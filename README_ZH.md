@@ -396,7 +396,10 @@ pnpm test:unit:watch
 pnpm build
 
 # 构建调试版本
-pnpm tauri build --debug
+pnpm build -- --debug
+
+# 构建 Release（生成 updater 产物；需要 TAURI_SIGNING_PRIVATE_KEY）
+pnpm build:release
 ```
 
 ### Rust 后端开发

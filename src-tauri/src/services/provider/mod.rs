@@ -61,6 +61,7 @@ mod tests {
     use serial_test::serial;
     use std::env;
     use std::fs;
+    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::TempDir;
@@ -119,6 +120,13 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner())
     }
 
+    fn pick_unused_local_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .map(|addr| addr.port())
+            .unwrap_or(0)
+    }
+
     fn with_test_home<T>(test: impl FnOnce(&AppState, &Path) -> T) -> T {
         let _guard = test_guard();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -162,6 +170,7 @@ mod tests {
             icon: None,
             icon_color: None,
             in_failover_queue: false,
+            failover_tier: 1,
         }
     }
 
@@ -191,6 +200,7 @@ mod tests {
             icon: None,
             icon_color: None,
             in_failover_queue: false,
+            failover_tier: 1,
         }
     }
 
@@ -232,6 +242,7 @@ mod tests {
             icon: None,
             icon_color: None,
             in_failover_queue: false,
+            failover_tier: 1,
         }
     }
 
@@ -328,6 +339,8 @@ base_url = "http://localhost:8080"
 
         let db = Arc::new(Database::memory().expect("init db"));
         let state = AppState::new(db.clone());
+        let proxy_port = pick_unused_local_port();
+        assert!(proxy_port > 0, "should allocate a local port");
 
         let original = Provider::with_id(
             "p1".into(),
@@ -351,6 +364,7 @@ base_url = "http://localhost:8080"
 
         db.update_proxy_config(ProxyConfig {
             live_takeover_active: true,
+            listen_port: proxy_port,
             ..Default::default()
         })
         .await
@@ -370,7 +384,7 @@ base_url = "http://localhost:8080"
             &get_claude_settings_path(),
             &json!({
                 "env": {
-                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721",
+                    "ANTHROPIC_BASE_URL": format!("http://127.0.0.1:{proxy_port}"),
                     "ANTHROPIC_API_KEY": "PROXY_MANAGED",
                     "ANTHROPIC_MODEL": "stale-model"
                 },
@@ -428,11 +442,12 @@ base_url = "http://localhost:8080"
             Some("PROXY_MANAGED"),
             "takeover placeholder should stay intact"
         );
+        let expected_proxy_url = format!("http://127.0.0.1:{proxy_port}");
         assert_eq!(
             live.get("env")
                 .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
                 .and_then(|v| v.as_str()),
-            Some("http://127.0.0.1:15721"),
+            Some(expected_proxy_url.as_str()),
             "proxy base URL should stay intact"
         );
         assert!(

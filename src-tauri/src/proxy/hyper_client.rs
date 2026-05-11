@@ -11,6 +11,8 @@ use http_body_util::BodyExt;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use std::sync::OnceLock;
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
 
 /// Our own header case map: maps lowercase header name → original wire-casing bytes.
 ///
@@ -71,6 +73,10 @@ fn global_hyper_client() -> &'static HyperClient {
             .build(connector)
     })
 }
+
+const TLS_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(3);
+static GLOBAL_TLS_CONNECTOR: OnceLock<RwLock<tokio_rustls::TlsConnector>> = OnceLock::new();
+static GLOBAL_TLS_CONNECTOR_LAST_REFRESH_AT: OnceLock<RwLock<Instant>> = OnceLock::new();
 
 /// Unified response wrapper that can hold either a hyper or reqwest response.
 ///
@@ -188,6 +194,7 @@ pub async fn send_request(
     body: Vec<u8>,
     timeout: std::time::Duration,
     proxy_url: Option<&str>,
+    proxy_basic_auth: Option<&http::header::HeaderValue>,
 ) -> Result<ProxyResponse, ProxyError> {
     // Extract our own OriginalHeaderCases if available
     let original_cases = original_extensions.get::<OriginalHeaderCases>().cloned();
@@ -215,6 +222,7 @@ pub async fn send_request(
                 original_cases.as_ref().unwrap(),
                 &body,
                 proxy_url,
+                proxy_basic_auth,
             ),
         )
         .await
@@ -320,6 +328,7 @@ async fn send_raw_request(
     original_cases: &OriginalHeaderCases,
     body: &[u8],
     proxy_url: Option<&str>,
+    proxy_basic_auth: Option<&http::header::HeaderValue>,
 ) -> Result<ProxyResponse, ProxyError> {
     use tokio::io::AsyncWriteExt;
 
@@ -337,7 +346,7 @@ async fn send_raw_request(
 
     // Establish TCP connection — either direct or through HTTP CONNECT proxy
     let stream = if let Some(proxy) = proxy_url {
-        connect_via_proxy(proxy, host, port).await?
+        connect_via_proxy(proxy, host, port, proxy_basic_auth).await?
     } else {
         ProxyStream::Tcp(
             tokio::net::TcpStream::connect((host, port))
@@ -392,6 +401,7 @@ async fn connect_via_proxy(
     proxy_url: &str,
     target_host: &str,
     target_port: u16,
+    proxy_basic_auth: Option<&http::header::HeaderValue>,
 ) -> Result<ProxyStream, ProxyError> {
     use base64::Engine;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -406,8 +416,15 @@ async fn connect_via_proxy(
         .port()
         .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
 
-    // Build Proxy-Authorization header if credentials are present
-    let proxy_auth = if !parsed.username().is_empty() {
+    // Build Proxy-Authorization header if credentials are present.
+    // Prefer the parsed system-proxy auth from hyper-util matcher (if provided),
+    // since it strips userinfo from the URI.
+    let proxy_auth = if let Some(auth) = proxy_basic_auth {
+        let auth_str = auth.to_str().map_err(|e| {
+            ProxyError::ForwardFailed(format!("Invalid proxy auth header value: {e}"))
+        })?;
+        Some(format!("Proxy-Authorization: {auth_str}\r\n"))
+    } else if !parsed.username().is_empty() {
         let password = parsed.password().unwrap_or("");
         let credentials = format!("{}:{}", parsed.username(), password);
         let encoded = base64::engine::general_purpose::STANDARD.encode(credentials);
@@ -504,21 +521,53 @@ async fn connect_via_proxy(
 /// Loads both webpki roots AND native system certificates so that
 /// proxy MITM CAs (e.g. Clash, mitmproxy) installed in the system
 /// keychain are trusted through the CONNECT tunnel.
-fn global_tls_connector() -> &'static tokio_rustls::TlsConnector {
-    static CONNECTOR: OnceLock<tokio_rustls::TlsConnector> = OnceLock::new();
-    CONNECTOR.get_or_init(|| {
-        let mut root_store = rustls::RootCertStore::empty();
-        // Baseline: Mozilla/webpki roots
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        // Native system certs (includes user-installed proxy CAs)
-        let native = rustls_native_certs::load_native_certs();
-        let (added, _errors) = root_store.add_parsable_certificates(native.certs);
-        log::debug!("[HyperClient] TLS root store: webpki + {added} native certs");
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
-    })
+fn build_tls_connector() -> tokio_rustls::TlsConnector {
+    let mut root_store = rustls::RootCertStore::empty();
+    // Baseline: Mozilla/webpki roots
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    // Native system certs (includes user-installed proxy CAs)
+    let native = rustls_native_certs::load_native_certs();
+    let (added, _errors) = root_store.add_parsable_certificates(native.certs);
+    log::debug!("[HyperClient] TLS root store: webpki + {added} native certs");
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+}
+
+fn global_tls_connector() -> tokio_rustls::TlsConnector {
+    let lock = GLOBAL_TLS_CONNECTOR.get_or_init(|| RwLock::new(build_tls_connector()));
+    lock.read()
+        .map(|c| c.clone())
+        .unwrap_or_else(|_| build_tls_connector())
+}
+
+pub fn refresh_tls_connector(reason: &str) -> bool {
+    let now = Instant::now();
+    let last_lock = GLOBAL_TLS_CONNECTOR_LAST_REFRESH_AT
+        .get_or_init(|| RwLock::new(now - TLS_REFRESH_MIN_INTERVAL));
+    {
+        let last = match last_lock.read() {
+            Ok(v) => *v,
+            Err(_) => return false,
+        };
+        if now.duration_since(last) < TLS_REFRESH_MIN_INTERVAL {
+            return false;
+        }
+    }
+
+    let lock = GLOBAL_TLS_CONNECTOR.get_or_init(|| RwLock::new(build_tls_connector()));
+    match lock.write() {
+        Ok(mut w) => {
+            *w = build_tls_connector();
+            if let Ok(mut last) = last_lock.write() {
+                *last = now;
+            }
+            log::info!("[HyperClient] TLS connector refreshed ({reason})");
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Build raw HTTP/1.1 request bytes with original header casing.

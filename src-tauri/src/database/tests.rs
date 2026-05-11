@@ -574,6 +574,7 @@ fn dry_run_validates_schema_compatibility() {
             icon: None,
             icon_color: None,
             in_failover_queue: false,
+            failover_tier: 1,
         },
     );
 

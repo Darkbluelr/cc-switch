@@ -28,6 +28,8 @@ export interface Provider {
   iconColor?: string; // 图标颜色（Hex 格式，如 "#00A67E"）
   // 是否加入故障转移队列
   inFailoverQueue?: boolean;
+  // 故障转移优先级梯度（1=最优先）
+  failoverTier?: number;
 }
 
 export interface AppConfig {

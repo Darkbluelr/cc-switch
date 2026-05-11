@@ -20,6 +20,13 @@ import { FailoverPriorityBadge } from "@/components/providers/FailoverPriorityBa
 import { extractCodexBaseUrl } from "@/utils/providerConfigUtils";
 import { useProviderHealth } from "@/lib/query/failover";
 import { useUsageQuery } from "@/lib/query/queries";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 
 interface DragHandleProps {
   attributes: DraggableAttributes;
@@ -50,9 +57,10 @@ interface ProviderCardProps {
   isProxyTakeover?: boolean; // 代理接管模式（Live配置已被接管，切换为热切换）
   dragHandleProps?: DragHandleProps;
   isAutoFailoverEnabled?: boolean; // 是否开启自动故障转移
-  failoverPriority?: number; // 故障转移优先级（1 = P1, 2 = P2, ...）
+  failoverTier?: number; // 故障转移优先级梯度（1 = P1, 2 = P2, ...）
   isInFailoverQueue?: boolean; // 是否在故障转移队列中
   onToggleFailover?: (enabled: boolean) => void; // 切换故障转移队列
+  onSetFailoverTier?: (tier: number) => void; // 设置故障转移优先级梯度
   activeProviderId?: string; // 代理当前实际使用的供应商 ID（用于故障转移模式下标注绿色边框）
   // OpenClaw: default model
   isDefaultModel?: boolean;
@@ -138,9 +146,10 @@ export function ProviderCard({
   isProxyTakeover = false,
   dragHandleProps,
   isAutoFailoverEnabled = false,
-  failoverPriority,
+  failoverTier,
   isInFailoverQueue = false,
   onToggleFailover,
+  onSetFailoverTier,
   activeProviderId,
   // OpenClaw: default model
   isDefaultModel,
@@ -152,6 +161,7 @@ export function ProviderCard({
   const isAnyOmo = isOmo || isOmoSlim;
   const handleDisableAnyOmo = isOmoSlim ? onDisableOmoSlim : onDisableOmo;
   const isAdditiveMode = appId === "opencode" && !isAnyOmo;
+  const effectiveFailoverTier = failoverTier ?? provider.failoverTier ?? 1;
 
   const { data: health } = useProviderHealth(provider.id, appId);
 
@@ -319,9 +329,26 @@ export function ProviderCard({
 
               {isAutoFailoverEnabled &&
                 isInFailoverQueue &&
-                failoverPriority && (
-                  <FailoverPriorityBadge priority={failoverPriority} />
-                )}
+                effectiveFailoverTier &&
+                (onSetFailoverTier ? (
+                  <Select
+                    value={String(effectiveFailoverTier)}
+                    onValueChange={(value) =>
+                      onSetFailoverTier(Number(value) || 1)
+                    }
+                  >
+                    <SelectTrigger className="h-5 px-1.5 py-0 text-[10px] font-semibold bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-0 shadow-none w-fit">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="1">P1</SelectItem>
+                      <SelectItem value="2">P2</SelectItem>
+                      <SelectItem value="3">P3</SelectItem>
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <FailoverPriorityBadge priority={effectiveFailoverTier} />
+                ))}
 
               {provider.category === "third_party" &&
                 provider.meta?.isPartner && (

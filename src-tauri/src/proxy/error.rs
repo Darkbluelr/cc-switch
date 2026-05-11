@@ -96,8 +96,7 @@ impl IntoResponse for ProxyError {
                     "type": "proxy_error",
                 }
             });
-            let mut response =
-                (StatusCode::SERVICE_UNAVAILABLE, Json(error_body)).into_response();
+            let mut response = (StatusCode::SERVICE_UNAVAILABLE, Json(error_body)).into_response();
             if let Some(ms) = retry_after_ms {
                 let secs = (*ms as f64 / 1000.0).ceil().max(1.0) as u64;
                 if let Ok(val) = axum::http::HeaderValue::from_str(&secs.to_string()) {

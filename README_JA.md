@@ -397,7 +397,10 @@ pnpm test:unit:watch
 pnpm build
 
 # デバッグビルド
-pnpm tauri build --debug
+pnpm build -- --debug
+
+# リリースビルド（updater 生成；TAURI_SIGNING_PRIVATE_KEY が必要）
+pnpm build:release
 ```
 
 ### Rust バックエンド開発

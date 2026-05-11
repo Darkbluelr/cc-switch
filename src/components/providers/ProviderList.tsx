@@ -33,6 +33,7 @@ import {
   useFailoverQueue,
   useAddToFailoverQueue,
   useRemoveFromFailoverQueue,
+  useSetFailoverTier,
 } from "@/lib/query/failover";
 import {
   useCurrentOmoProviderId,
@@ -137,6 +138,7 @@ export function ProviderList({
   const { data: failoverQueue } = useFailoverQueue(appId);
   const addToQueue = useAddToFailoverQueue();
   const removeFromQueue = useRemoveFromFailoverQueue();
+  const setFailoverTier = useSetFailoverTier();
 
   const isFailoverModeActive =
     isProxyTakeover === true && isAutoFailoverEnabled === true;
@@ -145,13 +147,11 @@ export function ProviderList({
   const { data: currentOmoId } = useCurrentOmoProviderId(isOpenCode);
   const { data: currentOmoSlimId } = useCurrentOmoSlimProviderId(isOpenCode);
 
-  const getFailoverPriority = useCallback(
+  const getFailoverTier = useCallback(
     (providerId: string): number | undefined => {
       if (!isFailoverModeActive || !failoverQueue) return undefined;
-      const index = failoverQueue.findIndex(
-        (item) => item.providerId === providerId,
-      );
-      return index >= 0 ? index + 1 : undefined;
+      const item = failoverQueue.find((entry) => entry.providerId === providerId);
+      return item ? item.failoverTier ?? 1 : undefined;
     },
     [isFailoverModeActive, failoverQueue],
   );
@@ -173,6 +173,13 @@ export function ProviderList({
       }
     },
     [appId, addToQueue, removeFromQueue],
+  );
+
+  const handleSetFailoverTier = useCallback(
+    (providerId: string, tier: number) => {
+      setFailoverTier.mutate({ appType: appId, providerId, tier });
+    },
+    [appId, setFailoverTier],
   );
 
   const [searchTerm, setSearchTerm] = useState("");
@@ -353,10 +360,13 @@ export function ProviderList({
                 isProxyRunning={isProxyRunning}
                 isProxyTakeover={isProxyTakeover}
                 isAutoFailoverEnabled={isFailoverModeActive}
-                failoverPriority={getFailoverPriority(provider.id)}
+                failoverTier={getFailoverTier(provider.id)}
                 isInFailoverQueue={isInFailoverQueue(provider.id)}
                 onToggleFailover={(enabled) =>
                   handleToggleFailover(provider.id, enabled)
+                }
+                onSetFailoverTier={(tier) =>
+                  handleSetFailoverTier(provider.id, tier)
                 }
                 activeProviderId={activeProviderId}
                 // OpenClaw: default model
@@ -486,9 +496,10 @@ interface SortableProviderCardProps {
   isProxyRunning: boolean;
   isProxyTakeover: boolean;
   isAutoFailoverEnabled: boolean;
-  failoverPriority?: number;
+  failoverTier?: number;
   isInFailoverQueue: boolean;
   onToggleFailover: (enabled: boolean) => void;
+  onSetFailoverTier: (tier: number) => void;
   activeProviderId?: string;
   // OpenClaw: default model
   isDefaultModel?: boolean;
@@ -517,9 +528,10 @@ function SortableProviderCard({
   isProxyRunning,
   isProxyTakeover,
   isAutoFailoverEnabled,
-  failoverPriority,
+  failoverTier,
   isInFailoverQueue,
   onToggleFailover,
+  onSetFailoverTier,
   activeProviderId,
   isDefaultModel,
   onSetAsDefault,
@@ -569,9 +581,10 @@ function SortableProviderCard({
           isDragging,
         }}
         isAutoFailoverEnabled={isAutoFailoverEnabled}
-        failoverPriority={failoverPriority}
+        failoverTier={failoverTier}
         isInFailoverQueue={isInFailoverQueue}
         onToggleFailover={onToggleFailover}
+        onSetFailoverTier={onSetFailoverTier}
         activeProviderId={activeProviderId}
         // OpenClaw: default model
         isDefaultModel={isDefaultModel}

@@ -20,7 +20,6 @@ use axum::{
     Router,
 };
 use hyper_util::rt::TokioIo;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
 use tokio::task::JoinHandle;
@@ -90,10 +89,7 @@ impl ProxyServer {
             return Err(ProxyError::AlreadyRunning);
         }
 
-        let addr: SocketAddr =
-            format!("{}:{}", self.config.listen_address, self.config.listen_port)
-                .parse()
-                .map_err(|e| ProxyError::BindFailed(format!("无效的地址: {e}")))?;
+        let bind_target = format!("{}:{}", self.config.listen_address, self.config.listen_port);
 
         // 创建关闭通道
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -102,11 +98,19 @@ impl ProxyServer {
         let app = self.build_router();
 
         // 绑定监听器
-        let listener = tokio::net::TcpListener::bind(&addr)
+        let listener = tokio::net::TcpListener::bind(&bind_target)
             .await
             .map_err(|e| ProxyError::BindFailed(e.to_string()))?;
+        let bound_addr = listener
+            .local_addr()
+            .map_err(|e| ProxyError::BindFailed(format!("读取实际监听地址失败: {e}")))?;
 
-        log::info!("[{}] 代理服务器启动于 {addr}", log_srv::STARTED);
+        log::info!(
+            "[{}] 代理服务器启动于 {} (configured: {})",
+            log_srv::STARTED,
+            bound_addr,
+            bind_target
+        );
 
         // 更新全局代理端口，用于系统代理检测
         crate::proxy::http_client::set_proxy_port(self.config.listen_port);
@@ -132,7 +136,7 @@ impl ProxyServer {
             loop {
                 tokio::select! {
                     result = listener.accept() => {
-                        let (stream, _remote_addr) = match result {
+                        let (stream, remote_addr) = match result {
                             Ok(v) => v,
                             Err(e) => {
                                 log::error!("[{SRV}] accept 失败: {e}", SRV = log_srv::ACCEPT_ERR);
@@ -141,7 +145,13 @@ impl ProxyServer {
                             }
                         };
 
+                        {
+                            let mut status = state.status.write().await;
+                            status.active_connections = status.active_connections.saturating_add(1);
+                        }
+
                         let app = app.clone();
+                        let state_for_conn = state.clone();
                         tokio::spawn(async move {
                             // Peek raw TCP bytes to capture original header casing
                             // before hyper parses (and lowercases) the header names.
@@ -157,7 +167,9 @@ impl ProxyServer {
                                         cases
                                     }
                                     Err(e) => {
-                                        log::debug!("[ProxyServer] peek failed (non-fatal): {e}");
+                                        log::debug!(
+                                            "[ProxyServer] peek failed from {remote_addr} (non-fatal): {e}"
+                                        );
                                         super::hyper_client::OriginalHeaderCases::default()
                                     }
                                 }
@@ -186,8 +198,15 @@ impl ProxyServer {
                                 .await
                             {
                                 // Connection reset / broken pipe 等在代理场景下很常见，debug 级别
-                                log::debug!("[{SRV}] connection error: {e}", SRV = log_srv::CONN_ERR);
+                                log::debug!(
+                                    "[{SRV}] connection error from {remote_addr}: {e}",
+                                    SRV = log_srv::CONN_ERR
+                                );
                             }
+
+                            let mut status = state_for_conn.status.write().await;
+                            status.active_connections =
+                                status.active_connections.saturating_sub(1);
                         });
                     }
                     _ = &mut shutdown_rx => {

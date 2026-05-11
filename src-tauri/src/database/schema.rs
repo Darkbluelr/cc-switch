@@ -39,6 +39,7 @@ impl Database {
                 meta TEXT NOT NULL DEFAULT '{}',
                 is_current BOOLEAN NOT NULL DEFAULT 0,
                 in_failover_queue BOOLEAN NOT NULL DEFAULT 0,
+                failover_tier INTEGER NOT NULL DEFAULT 1,
                 PRIMARY KEY (id, app_type)
             )",
             [],
@@ -338,14 +339,23 @@ impl Database {
             "BOOLEAN NOT NULL DEFAULT 0",
         )?;
 
+        // 故障转移优先级梯度（1=最优先）
+        Self::add_column_if_missing(
+            conn,
+            "providers",
+            "failover_tier",
+            "INTEGER NOT NULL DEFAULT 1",
+        )?;
+
         // 删除旧的 failover_queue 表（如果存在）
         let _ = conn.execute("DROP INDEX IF EXISTS idx_failover_queue_order", []);
         let _ = conn.execute("DROP TABLE IF EXISTS failover_queue", []);
 
         // 为故障转移队列创建索引（基于 providers 表）
+        let _ = conn.execute("DROP INDEX IF EXISTS idx_providers_failover", []);
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_providers_failover
-             ON providers(app_type, in_failover_queue, sort_index)",
+             ON providers(app_type, in_failover_queue, failover_tier, sort_index)",
             [],
         );
 

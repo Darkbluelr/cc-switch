@@ -35,6 +35,9 @@ const CLAUDE_MODEL_OVERRIDE_ENV_KEYS: [&str; 6] = [
     "ANTHROPIC_SMALL_FAST_MODEL",
 ];
 
+/// 本地代理绕过域名/IP（用于 NO_PROXY/no_proxy，避免 CLI 请求 localhost 被系统代理劫持）
+const LOCAL_PROXY_BYPASS_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
+
 #[derive(Clone)]
 pub struct ProxyService {
     db: Arc<Database>,
@@ -101,6 +104,7 @@ impl ProxyService {
             .as_object_mut()
             .expect("Claude env should be normalized to an object");
         env.insert("ANTHROPIC_BASE_URL".to_string(), json!(proxy_url));
+        Self::ensure_local_proxy_bypass_env(env);
 
         for key in CLAUDE_MODEL_OVERRIDE_ENV_KEYS {
             env.remove(key);
@@ -127,6 +131,75 @@ impl ProxyService {
                 json!(PROXY_TOKEN_PLACEHOLDER),
             );
         }
+    }
+
+    fn apply_gemini_takeover_fields(config: &mut Value, proxy_url: &str) {
+        if !config.is_object() {
+            *config = json!({});
+        }
+
+        let root = config
+            .as_object_mut()
+            .expect("Gemini config should be normalized to an object");
+        let env = root.entry("env".to_string()).or_insert_with(|| json!({}));
+        if !env.is_object() {
+            *env = json!({});
+        }
+
+        let env = env
+            .as_object_mut()
+            .expect("Gemini env should be normalized to an object");
+        env.insert("GOOGLE_GEMINI_BASE_URL".to_string(), json!(proxy_url));
+        // 使用占位符，避免显示缺少 key 的警告
+        env.insert("GEMINI_API_KEY".to_string(), json!(PROXY_TOKEN_PLACEHOLDER));
+        Self::ensure_local_proxy_bypass_env(env);
+    }
+
+    fn ensure_local_proxy_bypass_env(env: &mut serde_json::Map<String, Value>) {
+        let merged = Self::merge_local_proxy_bypass(
+            env.get("NO_PROXY").and_then(|v| v.as_str()),
+            env.get("no_proxy").and_then(|v| v.as_str()),
+        );
+        env.insert("NO_PROXY".to_string(), json!(merged.clone()));
+        env.insert("no_proxy".to_string(), json!(merged));
+    }
+
+    fn normalize_no_proxy_entry(entry: &str) -> String {
+        let trimmed = entry.trim();
+        let unbracketed = trimmed
+            .strip_prefix('[')
+            .and_then(|v| v.strip_suffix(']'))
+            .unwrap_or(trimmed);
+        unbracketed.to_ascii_lowercase()
+    }
+
+    fn merge_local_proxy_bypass(existing_upper: Option<&str>, existing_lower: Option<&str>) -> String {
+        let mut merged = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for raw in [existing_upper, existing_lower] {
+            if let Some(value) = raw {
+                for entry in value.split(',') {
+                    let trimmed = entry.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let normalized = Self::normalize_no_proxy_entry(trimmed);
+                    if seen.insert(normalized) {
+                        merged.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+
+        for host in LOCAL_PROXY_BYPASS_HOSTS {
+            let normalized = Self::normalize_no_proxy_entry(host);
+            if seen.insert(normalized) {
+                merged.push(host.to_string());
+            }
+        }
+
+        merged.join(",")
     }
 
     pub async fn sync_claude_live_from_provider_while_proxy_active(
@@ -958,16 +1031,7 @@ impl ProxyService {
 
         // Gemini: 修改 GOOGLE_GEMINI_BASE_URL，使用占位符替代真实 Token（代理会注入真实 Token）
         if let Ok(mut live_config) = self.read_gemini_live() {
-            if let Some(env) = live_config.get_mut("env").and_then(|v| v.as_object_mut()) {
-                env.insert("GOOGLE_GEMINI_BASE_URL".to_string(), json!(&proxy_url));
-                // 使用占位符，避免显示缺少 key 的警告
-                env.insert("GEMINI_API_KEY".to_string(), json!(PROXY_TOKEN_PLACEHOLDER));
-            } else {
-                live_config["env"] = json!({
-                    "GOOGLE_GEMINI_BASE_URL": &proxy_url,
-                    "GEMINI_API_KEY": PROXY_TOKEN_PLACEHOLDER
-                });
-            }
+            Self::apply_gemini_takeover_fields(&mut live_config, &proxy_url);
             self.write_gemini_live(&live_config)?;
             log::info!("Gemini Live 配置已接管，代理地址: {proxy_url}");
         }
@@ -1005,16 +1069,7 @@ impl ProxyService {
             }
             AppType::Gemini => {
                 let mut live_config = self.read_gemini_live()?;
-
-                if let Some(env) = live_config.get_mut("env").and_then(|v| v.as_object_mut()) {
-                    env.insert("GOOGLE_GEMINI_BASE_URL".to_string(), json!(&proxy_url));
-                    env.insert("GEMINI_API_KEY".to_string(), json!(PROXY_TOKEN_PLACEHOLDER));
-                } else {
-                    live_config["env"] = json!({
-                        "GOOGLE_GEMINI_BASE_URL": &proxy_url,
-                        "GEMINI_API_KEY": PROXY_TOKEN_PLACEHOLDER
-                    });
-                }
+                Self::apply_gemini_takeover_fields(&mut live_config, &proxy_url);
 
                 self.write_gemini_live(&live_config)?;
                 log::info!("Gemini Live 配置已接管，代理地址: {proxy_url}");
@@ -1063,15 +1118,7 @@ impl ProxyService {
             }
             AppType::Gemini => {
                 if let Ok(mut live_config) = self.read_gemini_live() {
-                    if let Some(env) = live_config.get_mut("env").and_then(|v| v.as_object_mut()) {
-                        env.insert("GOOGLE_GEMINI_BASE_URL".to_string(), json!(&proxy_url));
-                        env.insert("GEMINI_API_KEY".to_string(), json!(PROXY_TOKEN_PLACEHOLDER));
-                    } else {
-                        live_config["env"] = json!({
-                            "GOOGLE_GEMINI_BASE_URL": &proxy_url,
-                            "GEMINI_API_KEY": PROXY_TOKEN_PLACEHOLDER
-                        });
-                    }
+                    Self::apply_gemini_takeover_fields(&mut live_config, &proxy_url);
 
                     let _ = self.write_gemini_live(&live_config);
                 }
@@ -2079,6 +2126,48 @@ model = "gpt-5.1-codex"
             .expect("base_url should exist");
 
         assert_eq!(base_url, new_url);
+    }
+
+    #[test]
+    fn merge_local_proxy_bypass_adds_required_hosts() {
+        let merged = ProxyService::merge_local_proxy_bypass(None, None);
+        assert_eq!(merged, "127.0.0.1,localhost,::1");
+    }
+
+    #[test]
+    fn merge_local_proxy_bypass_preserves_existing_and_deduplicates() {
+        let merged = ProxyService::merge_local_proxy_bypass(
+            Some("corp.internal, localhost, [::1]"),
+            Some("127.0.0.1,corp.internal"),
+        );
+        assert_eq!(merged, "corp.internal,localhost,[::1],127.0.0.1");
+    }
+
+    #[test]
+    fn apply_claude_takeover_fields_also_sets_no_proxy() {
+        let mut config = json!({
+            "env": {
+                "ANTHROPIC_API_KEY": "live-token",
+                "NO_PROXY": "corp.internal"
+            }
+        });
+
+        ProxyService::apply_claude_takeover_fields(&mut config, "http://127.0.0.1:15721");
+
+        let env = config
+            .get("env")
+            .and_then(|v| v.as_object())
+            .expect("env object");
+        let no_proxy = env
+            .get("NO_PROXY")
+            .and_then(|v| v.as_str())
+            .expect("NO_PROXY exists");
+
+        assert_eq!(env.get("no_proxy").and_then(|v| v.as_str()), Some(no_proxy));
+        assert!(no_proxy.contains("corp.internal"));
+        assert!(no_proxy.contains("127.0.0.1"));
+        assert!(no_proxy.contains("localhost"));
+        assert!(no_proxy.contains("::1"));
     }
 
     #[tokio::test]

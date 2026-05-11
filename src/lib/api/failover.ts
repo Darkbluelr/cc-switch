@@ -85,6 +85,15 @@ export const failoverApi = {
     return invoke("remove_from_failover_queue", { appType, providerId });
   },
 
+  // 设置供应商故障转移优先级梯度（1=最优先）
+  async setFailoverTier(
+    appType: string,
+    providerId: string,
+    tier: number,
+  ): Promise<void> {
+    return invoke("set_failover_tier", { appType, providerId, tier });
+  },
+
   // 获取指定应用的自动故障转移开关状态
   async getAutoFailoverEnabled(appType: string): Promise<boolean> {
     return invoke("get_auto_failover_enabled", { appType });

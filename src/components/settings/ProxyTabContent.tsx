@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Server, Activity, Zap, Globe, ShieldAlert } from "lucide-react";
 import { motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
+import { invoke } from "@tauri-apps/api/core";
 import {
   Accordion,
   AccordionContent,
@@ -40,6 +41,24 @@ export function ProxyTabContent({
     isPending: isProxyPending,
   } = useProxyStatus();
 
+  const enableTakeoverForAllApps = async () => {
+    const appTypes = ["claude", "codex", "gemini"] as const;
+    const results = await Promise.allSettled(
+      appTypes.map((appType) =>
+        invoke("set_proxy_takeover_for_app", { appType, enabled: true }),
+      ),
+    );
+
+    results.forEach((result, index) => {
+      if (result.status === "rejected") {
+        console.warn(
+          `Auto takeover skipped for ${appTypes[index]}:`,
+          result.reason,
+        );
+      }
+    });
+  };
+
   const handleToggleProxy = async (checked: boolean) => {
     try {
       if (!checked) {
@@ -48,6 +67,7 @@ export function ProxyTabContent({
         setShowProxyConfirm(true);
       } else {
         await startProxyServer();
+        await enableTakeoverForAllApps();
       }
     } catch (error) {
       console.error("Toggle proxy failed:", error);
@@ -59,6 +79,7 @@ export function ProxyTabContent({
     try {
       await onAutoSave({ proxyConfirmed: true });
       await startProxyServer();
+      await enableTakeoverForAllApps();
     } catch (error) {
       console.error("Proxy confirm failed:", error);
     }

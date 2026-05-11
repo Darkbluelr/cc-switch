@@ -37,7 +37,10 @@ pub async fn get_provider_health_metrics(
         .get_provider_health_metrics(&app_type, window)
         .map_err(|e| e.to_string())?;
 
-    Ok(raw.into_iter().map(ProviderHealthMetricsView::from).collect())
+    Ok(raw
+        .into_iter()
+        .map(ProviderHealthMetricsView::from)
+        .collect())
 }
 
 /// 视图对象：在 DAO 原始计数之上加了派生比例，方便前端直接展示

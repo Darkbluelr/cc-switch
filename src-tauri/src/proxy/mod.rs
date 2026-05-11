@@ -5,6 +5,7 @@
 pub mod body_filter;
 pub mod cache_injector;
 pub mod circuit_breaker;
+pub mod cooldown;
 pub mod copilot_optimizer;
 pub mod error;
 pub mod error_mapper;
@@ -19,7 +20,7 @@ pub mod http_client;
 pub mod hyper_client;
 pub mod log_codes;
 pub mod model_mapper;
-pub mod cooldown;
+pub mod openai_param_normalizer;
 pub mod provider_router;
 pub mod providers;
 pub mod response_handler;

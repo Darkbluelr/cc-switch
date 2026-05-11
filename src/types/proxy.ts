@@ -111,6 +111,7 @@ export interface FailoverQueueItem {
   providerName: string;
   providerNotes?: string;
   sortIndex?: number;
+  failoverTier?: number;
 }
 
 /**

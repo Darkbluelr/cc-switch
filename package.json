@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "pnpm tauri dev",
     "build": "pnpm tauri build",
-    "tauri": "tauri",
+    "build:local": "pnpm tauri build",
+    "build:release": "pnpm exec tauri build",
+    "tauri": "node scripts/tauri-wrapper.js",
     "dev:renderer": "vite",
     "build:renderer": "vite build",
     "typecheck": "tsc --noEmit",

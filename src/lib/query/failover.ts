@@ -202,6 +202,43 @@ export function useRemoveFromFailoverQueue() {
   });
 }
 
+/**
+ * 设置供应商的故障转移优先级梯度（tier）
+ */
+export function useSetFailoverTier() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+
+  return useMutation({
+    mutationFn: ({
+      appType,
+      providerId,
+      tier,
+    }: {
+      appType: string;
+      providerId: string;
+      tier: number;
+    }) => failoverApi.setFailoverTier(appType, providerId, tier),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: ["failoverQueue", variables.appType],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["providers", variables.appType],
+      });
+    },
+    onError: (error: Error) => {
+      const detail = extractErrorMessage(error);
+      toast.error(
+        detail ||
+          t("failover.setTierFailed", {
+            defaultValue: "设置优先级失败",
+          }),
+      );
+    },
+  });
+}
+
 // ========== 自动故障转移开关 Hooks ==========
 
 /**

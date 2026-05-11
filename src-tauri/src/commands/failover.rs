@@ -58,6 +58,20 @@ pub async fn remove_from_failover_queue(
         .map_err(|e| e.to_string())
 }
 
+/// 设置供应商的故障转移优先级梯度（1=最优先）
+#[tauri::command]
+pub async fn set_failover_tier(
+    state: tauri::State<'_, AppState>,
+    app_type: String,
+    provider_id: String,
+    tier: usize,
+) -> Result<(), String> {
+    state
+        .db
+        .set_failover_tier(&app_type, &provider_id, tier)
+        .map_err(|e| e.to_string())
+}
+
 /// 获取指定应用的自动故障转移开关状态（从 proxy_config 表读取）
 #[tauri::command]
 pub async fn get_auto_failover_enabled(

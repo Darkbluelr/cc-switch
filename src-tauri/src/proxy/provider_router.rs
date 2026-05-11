@@ -94,16 +94,24 @@ impl ProviderRouter {
             .into_iter()
             .map(|item| item.provider_id)
             .collect();
-        self.cooldown.earliest_remaining_ms_all(app_type, &ids).await
+        self.cooldown
+            .earliest_remaining_ms_all(app_type, &ids)
+            .await
     }
 
     /// 选择可用的供应商（支持故障转移 + 会话亲和 + Round-Robin）
     ///
     /// 返回按优先级排序的可用供应商列表：
     /// - 故障转移关闭时：仅返回当前供应商
-    /// - 故障转移开启时：过滤掉冷却/熔断 provider 后，按如下优先级决定起点
-    ///   1. `session_key` 有值 → 一致性哈希起点（让同一会话尽量命中同一 key，利好 prompt cache）
-    ///   2. 否则 → Round-Robin 游标起点（跨会话均摊流量）
+    /// - 故障转移开启时：
+    ///   - 先按 `failover_tier` 分层（1=最优先），只在同层内做均摊/亲和
+    ///   - 只有当前层内**无任何可用候选**时，才降级到下一层
+    ///   - 结果列表会按层级拼接：P1 全部候选 → P2 全部候选 → …
+    ///     forwarder 会按该顺序逐个尝试，从而实现“同级耗尽再降级”
+    ///
+    /// 层内起点策略：
+    /// 1. `session_key` 有值 → 一致性哈希起点（让同一会话尽量命中同一 key，利好 prompt cache）
+    /// 2. 否则 → Round-Robin 游标起点（跨会话均摊流量）
     ///
     /// `session_key` 只应在客户端明确提供了会话标识时传入（比如 Claude 的
     /// `x-claude-code-session-id` 或 Codex 的 `session_id` 头），内部新生成的 UUID
@@ -128,20 +136,30 @@ impl ProviderRouter {
         };
 
         if auto_failover_enabled {
-            // 故障转移开启：从队列中筛选出熔断器允许且未在短冷却期的候选，再按 RR 轮转起点
+            // 故障转移开启：按 tier 分层筛选候选，同层内轮转起点
             let all_providers = self.db.get_all_providers(app_type)?;
 
-            // 使用 DAO 返回的排序结果，确保和前端展示一致
-            let ordered_ids: Vec<String> = self
-                .db
-                .get_failover_queue(app_type)?
-                .into_iter()
-                .map(|item| item.provider_id)
-                .collect();
+            // 使用 DAO 返回的排序结果，确保和前端展示一致（tier ASC, sort_index ASC）
+            let ordered_items = self.db.get_failover_queue(app_type)?;
+            total_providers = ordered_items.len();
 
-            total_providers = ordered_ids.len();
+            // RR：每次请求只自增一次，避免多 tier 时过快推进
+            let rr_base = match session_key {
+                Some(key) if !key.is_empty() => None,
+                _ => Some(
+                    self.get_or_create_rr_cursor(app_type)
+                        .await
+                        .fetch_add(1, Ordering::Relaxed),
+                ),
+            };
 
-            for provider_id in ordered_ids {
+            let mut tiers: Vec<(usize, Vec<Provider>)> = Vec::new();
+            let mut last_tier: Option<usize> = None;
+
+            for item in ordered_items {
+                let provider_id = item.provider_id;
+                let tier = item.failover_tier.max(1);
+
                 let Some(provider) = all_providers.get(&provider_id).cloned() else {
                     continue;
                 };
@@ -156,28 +174,30 @@ impl ProviderRouter {
                 let circuit_key = format!("{app_type}:{}", provider.id);
                 let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
                 if breaker.is_available().await {
-                    result.push(provider);
+                    if last_tier != Some(tier) {
+                        tiers.push((tier, Vec::new()));
+                        last_tier = Some(tier);
+                    }
+                    if let Some((_, providers)) = tiers.last_mut() {
+                        providers.push(provider);
+                    }
                 } else {
                     circuit_open_count += 1;
                 }
             }
 
-            // 3) 候选 ≥ 2 时决定"起点"：
-            //    - 客户端提供了 session_key：用一致性哈希粘到同一个 key（有利 prompt cache 命中）
-            //    - 否则：用 RR 游标均摊
-            //    注：当原本粘住的 key 进入冷却/熔断时会被步骤 1/2 过滤掉，哈希会自然落到剩余
-            //    候选里的另一个 provider，天然兼顾"亲和"和"退路"。
-            if result.len() > 1 {
-                let offset = match session_key {
-                    Some(key) if !key.is_empty() => hash_to_offset(key, result.len()),
-                    _ => {
-                        let cursor = self.get_or_create_rr_cursor(app_type).await;
-                        cursor.fetch_add(1, Ordering::Relaxed) % result.len()
+            // 3) 逐层拼接：同层内轮转起点，层与层之间严格按 tier 顺序降级
+            for (_tier, mut providers) in tiers {
+                if providers.len() > 1 {
+                    let offset = match session_key {
+                        Some(key) if !key.is_empty() => hash_to_offset(key, providers.len()),
+                        _ => rr_base.unwrap_or(0) as usize % providers.len(),
+                    };
+                    if offset > 0 {
+                        providers.rotate_left(offset);
                     }
-                };
-                if offset > 0 {
-                    result.rotate_left(offset);
                 }
+                result.extend(providers);
             }
         } else {
             // 故障转移关闭：仅使用当前供应商，跳过熔断器检查
@@ -199,9 +219,7 @@ impl ProviderRouter {
         }
 
         if result.is_empty() {
-            if total_providers > 0
-                && (circuit_open_count + rate_limited_count) == total_providers
-            {
+            if total_providers > 0 && (circuit_open_count + rate_limited_count) == total_providers {
                 log::warn!(
                     "[{app_type}] [FO-004] 所有供应商暂不可用（熔断 {circuit_open_count}，冷却 {rate_limited_count}）"
                 );
@@ -643,12 +661,8 @@ mod tests {
 
         // 三个 provider，sort_index 固定：a=1, b=2, c=3
         for (id, idx) in [("a", 1usize), ("b", 2), ("c", 3)] {
-            let mut p = Provider::with_id(
-                id.to_string(),
-                format!("Provider {id}"),
-                json!({}),
-                None,
-            );
+            let mut p =
+                Provider::with_id(id.to_string(), format!("Provider {id}"), json!({}), None);
             p.sort_index = Some(idx);
             db.save_provider("claude", &p).unwrap();
             db.add_to_failover_queue("claude", id).unwrap();
@@ -665,12 +679,18 @@ mod tests {
         let third = router.select_providers("claude", None).await.unwrap();
 
         // 三次调用的"起点"应分别是 a, b, c（RR 轮转）
-        assert_eq!(first.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
-            vec!["a", "b", "c"]);
-        assert_eq!(second.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
-            vec!["b", "c", "a"]);
-        assert_eq!(third.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
-            vec!["c", "a", "b"]);
+        assert_eq!(
+            first.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(
+            second.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+            vec!["b", "c", "a"]
+        );
+        assert_eq!(
+            third.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+            vec!["c", "a", "b"]
+        );
     }
 
     /// 冷却过滤：刚失败过的 provider 在冷却期内应被 select 跳过
@@ -722,12 +742,8 @@ mod tests {
         let db = Arc::new(Database::memory().unwrap());
 
         for (id, idx) in [("a", 1usize), ("b", 2), ("c", 3)] {
-            let mut p = Provider::with_id(
-                id.to_string(),
-                format!("Provider {id}"),
-                json!({}),
-                None,
-            );
+            let mut p =
+                Provider::with_id(id.to_string(), format!("Provider {id}"), json!({}), None);
             p.sort_index = Some(idx);
             db.save_provider("claude", &p).unwrap();
             db.add_to_failover_queue("claude", id).unwrap();

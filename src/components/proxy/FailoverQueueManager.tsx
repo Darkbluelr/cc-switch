@@ -3,7 +3,7 @@
  *
  * 允许用户管理代理模式下的故障转移队列，支持：
  * - 添加/移除供应商
- * - 队列顺序基于首页供应商列表的 sort_index
+ * - 队列顺序按 failover_tier 分层，其内基于首页供应商列表的 sort_index
  */
 
 import { useState } from "react";
@@ -28,6 +28,7 @@ import {
   useAvailableProvidersForFailover,
   useAddToFailoverQueue,
   useRemoveFromFailoverQueue,
+  useSetFailoverTier,
   useAutoFailoverEnabled,
   useSetAutoFailoverEnabled,
   useProviderHealthMetrics,
@@ -45,6 +46,7 @@ export function FailoverQueueManager({
 }: FailoverQueueManagerProps) {
   const { t } = useTranslation();
   const [selectedProviderId, setSelectedProviderId] = useState<string>("");
+  const [selectedTier, setSelectedTier] = useState<string>("1");
 
   // 故障转移开关状态（每个应用独立）
   const { data: isFailoverEnabled = false } = useAutoFailoverEnabled(appType);
@@ -68,6 +70,7 @@ export function FailoverQueueManager({
   // Mutations
   const addToQueue = useAddToFailoverQueue();
   const removeFromQueue = useRemoveFromFailoverQueue();
+  const setFailoverTier = useSetFailoverTier();
 
   // 切换故障转移开关
   const handleToggleFailover = (enabled: boolean) => {
@@ -83,7 +86,18 @@ export function FailoverQueueManager({
         appType,
         providerId: selectedProviderId,
       });
+
+      const tier = Number(selectedTier);
+      if (tier && tier !== 1) {
+        await setFailoverTier.mutateAsync({
+          appType,
+          providerId: selectedProviderId,
+          tier,
+        });
+      }
+
       setSelectedProviderId("");
+      setSelectedTier("1");
       toast.success(
         t("proxy.failoverQueue.addSuccess", "已添加到故障转移队列"),
         { closeButton: true },
@@ -106,6 +120,22 @@ export function FailoverQueueManager({
     } catch (error) {
       toast.error(
         t("proxy.failoverQueue.removeFailed", "移除失败") +
+          ": " +
+          String(error),
+      );
+    }
+  };
+
+  const handleSetTier = async (providerId: string, tier: number) => {
+    try {
+      await setFailoverTier.mutateAsync({ appType, providerId, tier });
+      toast.success(
+        t("proxy.failoverQueue.setTierSuccess", "优先级已更新"),
+        { closeButton: true },
+      );
+    } catch (error) {
+      toast.error(
+        t("proxy.failoverQueue.setTierFailed", "优先级更新失败") +
           ": " +
           String(error),
       );
@@ -149,7 +179,7 @@ export function FailoverQueueManager({
           <p className="text-xs text-muted-foreground">
             {t("proxy.failover.autoSwitchDescription", {
               defaultValue:
-                "开启后将立即切换到队列 P1，并在请求失败时自动切换到队列中的下一个供应商",
+                "开启后优先使用 P1；只有 P1 全部不可用/失败后才降级到 P2（以此类推）",
             })}
           </p>
         </div>
@@ -166,7 +196,7 @@ export function FailoverQueueManager({
         <AlertDescription className="text-sm">
           {t(
             "proxy.failoverQueue.info",
-            "队列顺序与首页供应商列表顺序一致。当请求失败时，系统会按顺序依次尝试队列中的供应商。",
+            "系统会按优先级层级（P1 → P2 → …）进行故障转移；同一层可配置多个供应商。",
           )}
         </AlertDescription>
       </Alert>
@@ -207,9 +237,30 @@ export function FailoverQueueManager({
             )}
           </SelectContent>
         </Select>
+
+        <Select
+          value={selectedTier}
+          onValueChange={setSelectedTier}
+          disabled={disabled}
+        >
+          <SelectTrigger className="w-[4.25rem]">
+            <SelectValue placeholder="P1" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="1">P1</SelectItem>
+            <SelectItem value="2">P2</SelectItem>
+            <SelectItem value="3">P3</SelectItem>
+          </SelectContent>
+        </Select>
+
         <Button
           onClick={handleAddProvider}
-          disabled={disabled || !selectedProviderId || addToQueue.isPending}
+          disabled={
+            disabled ||
+            !selectedProviderId ||
+            addToQueue.isPending ||
+            setFailoverTier.isPending
+          }
           size="icon"
           variant="outline"
         >
@@ -233,14 +284,15 @@ export function FailoverQueueManager({
         </div>
       ) : (
         <div className="space-y-2">
-          {queue.map((item, index) => (
+          {queue.map((item) => (
             <QueueItem
               key={item.providerId}
               item={item}
-              index={index}
               disabled={disabled}
               onRemove={handleRemoveProvider}
+              onSetTier={handleSetTier}
               isRemoving={removeFromQueue.isPending}
+              isUpdatingTier={setFailoverTier.isPending}
               metrics={metricsByProvider.get(item.providerId)}
             />
           ))}
@@ -252,7 +304,7 @@ export function FailoverQueueManager({
         <p className="text-xs text-muted-foreground">
           {t(
             "proxy.failoverQueue.orderHint",
-            "队列顺序与首页供应商列表顺序一致，可在首页拖拽调整顺序。",
+            "同一优先级内的顺序与首页供应商列表顺序一致，可在首页拖拽调整。",
           )}
         </p>
       )}
@@ -262,19 +314,21 @@ export function FailoverQueueManager({
 
 interface QueueItemProps {
   item: FailoverQueueItem;
-  index: number;
   disabled: boolean;
   onRemove: (providerId: string) => void;
+  onSetTier: (providerId: string, tier: number) => void;
   isRemoving: boolean;
+  isUpdatingTier: boolean;
   metrics?: ProviderHealthMetricsView;
 }
 
 function QueueItem({
   item,
-  index,
   disabled,
   onRemove,
+  onSetTier,
   isRemoving,
+  isUpdatingTier,
   metrics,
 }: QueueItemProps) {
   const { t } = useTranslation();
@@ -285,9 +339,9 @@ function QueueItem({
         "flex items-center gap-3 rounded-lg border bg-card p-3 transition-colors",
       )}
     >
-      {/* 序号 */}
+      {/* 优先级 */}
       <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-medium">
-        {index + 1}
+        P{item.failoverTier ?? 1}
       </div>
 
       {/* 供应商名称 + 指标徽章 */}
@@ -305,7 +359,22 @@ function QueueItem({
         </div>
       </div>
 
-      {/* 删除按钮 */}
+      {/* Tier 选择 + 删除按钮 */}
+      <Select
+        value={String(item.failoverTier ?? 1)}
+        onValueChange={(value) => onSetTier(item.providerId, Number(value))}
+        disabled={disabled || isUpdatingTier}
+      >
+        <SelectTrigger className="h-8 w-[4.25rem]">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="1">P1</SelectItem>
+          <SelectItem value="2">P2</SelectItem>
+          <SelectItem value="3">P3</SelectItem>
+        </SelectContent>
+      </Select>
+
       <Button
         variant="ghost"
         size="icon"
