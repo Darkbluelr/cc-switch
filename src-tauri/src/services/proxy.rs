@@ -38,6 +38,23 @@ const CLAUDE_MODEL_OVERRIDE_ENV_KEYS: [&str; 6] = [
 /// 本地代理绕过域名/IP（用于 NO_PROXY/no_proxy，避免 CLI 请求 localhost 被系统代理劫持）
 const LOCAL_PROXY_BYPASS_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
 
+/// Codex takeover 时，沿用当前 live config 里这些非路由字段/表，避免临时丢失用户日常配置。
+///
+/// 注意：显式排除 provider / auth / profile 相关键，防止它们把流量重新导向官方端点，
+/// 造成 CLI 一直 reconnecting 但本地代理完全收不到请求。
+const CODEX_TAKEOVER_RESERVED_TOML_KEYS: [&str; 10] = [
+    "base_url",
+    "bearer_token",
+    "chatgpt_base_url",
+    "disable_response_storage",
+    "experimental_bearer_token",
+    "model",
+    "model_provider",
+    "model_providers",
+    "model_reasoning_effort",
+    "profiles",
+];
+
 #[derive(Clone)]
 pub struct ProxyService {
     db: Arc<Database>,
@@ -153,6 +170,32 @@ impl ProxyService {
         // 使用占位符，避免显示缺少 key 的警告
         env.insert("GEMINI_API_KEY".to_string(), json!(PROXY_TOKEN_PLACEHOLDER));
         Self::ensure_local_proxy_bypass_env(env);
+    }
+
+    fn apply_codex_takeover_fields(config: &mut Value, proxy_codex_base_url: &str) {
+        if !config.is_object() {
+            *config = json!({});
+        }
+
+        let root = config
+            .as_object_mut()
+            .expect("Codex config should be normalized to an object");
+
+        let auth = root.entry("auth".to_string()).or_insert_with(|| json!({}));
+        if !auth.is_object() {
+            *auth = json!({});
+        }
+        auth.as_object_mut()
+            .expect("Codex auth should be normalized to an object")
+            .insert("OPENAI_API_KEY".to_string(), json!(PROXY_TOKEN_PLACEHOLDER));
+
+        let current_config = root
+            .get("config")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let updated_config = Self::update_toml_base_url(&current_config, proxy_codex_base_url);
+        root.insert("config".to_string(), json!(updated_config));
     }
 
     fn ensure_local_proxy_bypass_env(env: &mut serde_json::Map<String, Value>) {
@@ -1011,20 +1054,10 @@ impl ProxyService {
         }
 
         // Codex: 修改 config.toml 的 base_url，auth.json 的 OPENAI_API_KEY（代理会注入真实 Token）
-        if let Ok(mut live_config) = self.read_codex_live() {
-            // 1. 修改 auth.json 中的 OPENAI_API_KEY（使用占位符）
-            if let Some(auth) = live_config.get_mut("auth").and_then(|v| v.as_object_mut()) {
-                auth.insert("OPENAI_API_KEY".to_string(), json!(PROXY_TOKEN_PLACEHOLDER));
-            }
-
-            // 2. 修改 config.toml 中的 base_url
-            let config_str = live_config
-                .get("config")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let updated_config = Self::update_toml_base_url(config_str, &proxy_codex_base_url);
-            live_config["config"] = json!(updated_config);
-
+        if let Ok(live_config) = self
+            .prepare_codex_takeover_live_config(&proxy_codex_base_url)
+            .await
+        {
             self.write_codex_live(&live_config)?;
             log::info!("Codex Live 配置已接管，代理地址: {proxy_codex_base_url}");
         }
@@ -1051,19 +1084,9 @@ impl ProxyService {
                 log::info!("Claude Live 配置已接管，代理地址: {proxy_url}");
             }
             AppType::Codex => {
-                let mut live_config = self.read_codex_live()?;
-
-                if let Some(auth) = live_config.get_mut("auth").and_then(|v| v.as_object_mut()) {
-                    auth.insert("OPENAI_API_KEY".to_string(), json!(PROXY_TOKEN_PLACEHOLDER));
-                }
-
-                let config_str = live_config
-                    .get("config")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let updated_config = Self::update_toml_base_url(config_str, &proxy_codex_base_url);
-                live_config["config"] = json!(updated_config);
-
+                let live_config = self
+                    .prepare_codex_takeover_live_config(&proxy_codex_base_url)
+                    .await?;
                 self.write_codex_live(&live_config)?;
                 log::info!("Codex Live 配置已接管，代理地址: {proxy_codex_base_url}");
             }
@@ -1099,20 +1122,10 @@ impl ProxyService {
                 }
             }
             AppType::Codex => {
-                if let Ok(mut live_config) = self.read_codex_live() {
-                    if let Some(auth) = live_config.get_mut("auth").and_then(|v| v.as_object_mut())
-                    {
-                        auth.insert("OPENAI_API_KEY".to_string(), json!(PROXY_TOKEN_PLACEHOLDER));
-                    }
-
-                    let config_str = live_config
-                        .get("config")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let updated_config =
-                        Self::update_toml_base_url(config_str, &proxy_codex_base_url);
-                    live_config["config"] = json!(updated_config);
-
+                if let Ok(live_config) = self
+                    .prepare_codex_takeover_live_config(&proxy_codex_base_url)
+                    .await
+                {
                     let _ = self.write_codex_live(&live_config);
                 }
             }
@@ -1733,6 +1746,140 @@ impl ProxyService {
 
         target_obj.insert("config".to_string(), json!(target_doc.to_string()));
         Ok(())
+    }
+
+    async fn prepare_codex_takeover_live_config(
+        &self,
+        proxy_codex_base_url: &str,
+    ) -> Result<Value, String> {
+        let live_config = self.read_codex_live()?;
+
+        let mut takeover_config = match self.build_codex_takeover_base_config(&live_config).await {
+            Ok(config) => config,
+            Err(err) => {
+                log::warn!(
+                    "构建 Codex takeover 基础配置失败，将回退为直接修改当前 live 配置: {err}"
+                );
+                live_config
+            }
+        };
+
+        Self::apply_codex_takeover_fields(&mut takeover_config, proxy_codex_base_url);
+        Ok(takeover_config)
+    }
+
+    async fn build_codex_takeover_base_config(
+        &self,
+        existing_live: &Value,
+    ) -> Result<Value, String> {
+        let current_id = crate::settings::get_effective_current_provider(&self.db, &AppType::Codex)
+            .map_err(|e| format!("获取 Codex 当前供应商失败: {e}"))?
+            .ok_or_else(|| "Codex 当前未选择供应商".to_string())?;
+
+        let provider = self
+            .db
+            .get_provider_by_id(&current_id, "codex")
+            .map_err(|e| format!("读取 Codex 当前供应商失败: {e}"))?
+            .ok_or_else(|| format!("Codex 当前供应商不存在: {current_id}"))?;
+
+        let mut effective_settings =
+            build_effective_settings_with_common_config(self.db.as_ref(), &AppType::Codex, &provider)
+                .map_err(|e| format!("构建 Codex 有效配置失败: {e}"))?;
+
+        Self::preserve_codex_live_extras_for_takeover(&mut effective_settings, existing_live);
+        Ok(effective_settings)
+    }
+
+    fn preserve_codex_live_extras_for_takeover(
+        target_settings: &mut Value,
+        existing_live: &Value,
+    ) {
+        let Some(target_obj) = target_settings.as_object_mut() else {
+            log::warn!("Codex takeover 基础配置不是对象，跳过保留 live extras");
+            return;
+        };
+
+        let target_config = target_obj
+            .get("config")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mut target_doc = if target_config.trim().is_empty() {
+            toml_edit::DocumentMut::new()
+        } else {
+            match target_config.parse::<toml_edit::DocumentMut>() {
+                Ok(doc) => doc,
+                Err(err) => {
+                    log::warn!("解析 Codex takeover 基础 config.toml 失败，跳过保留 live extras: {err}");
+                    return;
+                }
+            }
+        };
+
+        let existing_config = existing_live
+            .get("config")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if existing_config.trim().is_empty() {
+            target_obj.insert("config".to_string(), json!(target_doc.to_string()));
+            return;
+        }
+
+        let existing_doc = match existing_config.parse::<toml_edit::DocumentMut>() {
+            Ok(doc) => doc,
+            Err(err) => {
+                log::warn!("解析当前 Codex live config.toml 失败，跳过保留 live extras: {err}");
+                target_obj.insert("config".to_string(), json!(target_doc.to_string()));
+                return;
+            }
+        };
+
+        Self::merge_codex_live_extras(&mut target_doc, &existing_doc);
+        target_obj.insert("config".to_string(), json!(target_doc.to_string()));
+    }
+
+    fn merge_codex_live_extras(
+        target_doc: &mut toml_edit::DocumentMut,
+        existing_doc: &toml_edit::DocumentMut,
+    ) {
+        for (key, existing_item) in existing_doc.as_table().iter() {
+            if CODEX_TAKEOVER_RESERVED_TOML_KEYS.contains(&key) {
+                continue;
+            }
+
+            match target_doc.as_table_mut().get_mut(key) {
+                Some(target_item) => Self::merge_codex_toml_item(target_item, existing_item),
+                None => {
+                    target_doc
+                        .as_table_mut()
+                        .insert(key, existing_item.clone());
+                }
+            }
+        }
+    }
+
+    fn merge_codex_toml_item(target: &mut toml_edit::Item, source: &toml_edit::Item) {
+        if let Some(source_table) = source.as_table_like() {
+            if let Some(target_table) = target.as_table_like_mut() {
+                Self::merge_codex_toml_table_like(target_table, source_table);
+                return;
+            }
+        }
+
+        *target = source.clone();
+    }
+
+    fn merge_codex_toml_table_like(
+        target: &mut dyn toml_edit::TableLike,
+        source: &dyn toml_edit::TableLike,
+    ) {
+        for (key, source_item) in source.iter() {
+            match target.get_mut(key) {
+                Some(target_item) => Self::merge_codex_toml_item(target_item, source_item),
+                None => {
+                    target.insert(key, source_item.clone());
+                }
+            }
+        }
     }
 
     /// 代理模式下切换供应商（热切换，不写 Live）
@@ -2903,6 +3050,111 @@ command = "latest-command"
                 .and_then(|v| v.as_str()),
             Some("latest-command"),
             "new MCP entries should remain in the restore backup"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn codex_takeover_uses_current_provider_config_and_preserves_live_extras() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db.clone());
+
+        let provider = Provider::with_id(
+            "p1".to_string(),
+            "P1".to_string(),
+            json!({
+                "auth": {
+                    "OPENAI_API_KEY": "provider-key"
+                },
+                "config": r#"model_provider = "custom"
+model = "gpt-5.4"
+disable_response_storage = true
+
+[model_providers.custom]
+name = "custom"
+base_url = "https://api.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider)
+            .expect("save provider");
+        db.set_current_provider("codex", "p1")
+            .expect("set current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some("p1"))
+            .expect("set local current provider");
+
+        crate::config::write_json_file(
+            &crate::codex_config::get_codex_auth_path(),
+            &json!({ "OPENAI_API_KEY": "live-token" }),
+        )
+        .expect("seed auth.json");
+        std::fs::write(
+            crate::codex_config::get_codex_config_path(),
+            r#"[mcp_servers.echo]
+command = "echo-server"
+
+[projects."/repo"]
+trust_level = "trusted"
+"#,
+        )
+        .expect("seed config.toml");
+
+        service
+            .takeover_live_config_strict(&AppType::Codex)
+            .await
+            .expect("takeover codex live");
+
+        let live = service.read_codex_live().expect("read live config");
+        assert_eq!(
+            live.get("auth")
+                .and_then(|auth| auth.get("OPENAI_API_KEY"))
+                .and_then(|value| value.as_str()),
+            Some(PROXY_TOKEN_PLACEHOLDER),
+            "takeover auth should use proxy placeholder"
+        );
+
+        let config_str = live
+            .get("config")
+            .and_then(|value| value.as_str())
+            .expect("config string");
+        let parsed: toml::Value = toml::from_str(config_str).expect("parse live codex config");
+        assert_eq!(
+            parsed.get("model_provider").and_then(|v| v.as_str()),
+            Some("custom"),
+            "takeover must keep a runnable provider config"
+        );
+        assert_eq!(
+            parsed
+                .get("model_providers")
+                .and_then(|v| v.get("custom"))
+                .and_then(|v| v.get("base_url"))
+                .and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:15721/v1"),
+            "takeover must rewrite the active provider base_url to the local proxy"
+        );
+        assert_eq!(
+            parsed
+                .get("mcp_servers")
+                .and_then(|v| v.get("echo"))
+                .and_then(|v| v.get("command"))
+                .and_then(|v| v.as_str()),
+            Some("echo-server"),
+            "live MCP entries should be preserved"
+        );
+        assert_eq!(
+            parsed
+                .get("projects")
+                .and_then(|v| v.get("/repo"))
+                .and_then(|v| v.get("trust_level"))
+                .and_then(|v| v.as_str()),
+            Some("trusted"),
+            "user project trust should be preserved"
         );
     }
 }
