@@ -1471,6 +1471,9 @@ pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
 /// 检查 `proxy_config.enabled` 字段，如果有任一应用的状态为 `true`，
 /// 则自动启动代理服务并接管对应应用的 Live 配置。
 async fn restore_proxy_state_on_startup(state: &store::AppState) {
+    const STARTUP_RESTORE_MAX_ATTEMPTS: usize = 5;
+    const STARTUP_RESTORE_RETRY_DELAY_MS: u64 = 1200;
+
     // 收集需要恢复接管的应用列表（从 proxy_config.enabled 读取）
     let mut apps_to_restore = Vec::new();
     for app_type in ["claude", "codex", "gemini"] {
@@ -1490,25 +1493,40 @@ async fn restore_proxy_state_on_startup(state: &store::AppState) {
 
     // 逐个恢复接管状态
     for app_type in apps_to_restore {
-        match state
-            .proxy_service
-            .set_takeover_for_app(app_type, true)
-            .await
-        {
-            Ok(()) => {
-                log::info!("✓ 已恢复 {app_type} 的代理接管状态");
-            }
-            Err(e) => {
-                log::error!("✗ 恢复 {app_type} 的代理接管状态失败: {e}");
-                // 失败时清除该应用的状态，避免下次启动再次尝试
-                if let Err(clear_err) = state
-                    .proxy_service
-                    .set_takeover_for_app(app_type, false)
-                    .await
-                {
-                    log::error!("清除 {app_type} 代理状态失败: {clear_err}");
+        let mut restored = false;
+
+        for attempt in 1..=STARTUP_RESTORE_MAX_ATTEMPTS {
+            match state
+                .proxy_service
+                .set_takeover_for_app(app_type, true)
+                .await
+            {
+                Ok(()) => {
+                    log::info!("✓ 已恢复 {app_type} 的代理接管状态");
+                    restored = true;
+                    break;
+                }
+                Err(e) => {
+                    if attempt < STARTUP_RESTORE_MAX_ATTEMPTS {
+                        log::warn!(
+                            "恢复 {app_type} 代理接管状态失败（第 {attempt}/{STARTUP_RESTORE_MAX_ATTEMPTS} 次）: {e}；{}ms 后重试",
+                            STARTUP_RESTORE_RETRY_DELAY_MS
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            STARTUP_RESTORE_RETRY_DELAY_MS,
+                        ))
+                        .await;
+                    } else {
+                        log::error!(
+                            "✗ 恢复 {app_type} 的代理接管状态失败（已重试 {STARTUP_RESTORE_MAX_ATTEMPTS} 次）: {e}"
+                        );
+                    }
                 }
             }
+        }
+
+        if !restored {
+            log::warn!("{app_type} 代理状态将保持 enabled=true，等待下次启动或后续重试自动恢复");
         }
     }
 }

@@ -42,7 +42,7 @@ const LOCAL_PROXY_BYPASS_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
 ///
 /// 注意：显式排除 provider / auth / profile 相关键，防止它们把流量重新导向官方端点，
 /// 造成 CLI 一直 reconnecting 但本地代理完全收不到请求。
-const CODEX_TAKEOVER_RESERVED_TOML_KEYS: [&str; 10] = [
+const CODEX_TAKEOVER_RESERVED_TOML_KEYS: [&str; 11] = [
     "base_url",
     "bearer_token",
     "chatgpt_base_url",
@@ -52,6 +52,7 @@ const CODEX_TAKEOVER_RESERVED_TOML_KEYS: [&str; 10] = [
     "model_provider",
     "model_providers",
     "model_reasoning_effort",
+    "profile",
     "profiles",
 ];
 
@@ -195,7 +196,17 @@ impl ProxyService {
             .unwrap_or("")
             .to_string();
         let updated_config = Self::update_toml_base_url(&current_config, proxy_codex_base_url);
+        let updated_config = Self::remove_codex_toml_profile_override(&updated_config);
         root.insert("config".to_string(), json!(updated_config));
+    }
+
+    fn remove_codex_toml_profile_override(toml_str: &str) -> String {
+        let mut doc = match toml_str.parse::<toml_edit::DocumentMut>() {
+            Ok(doc) => doc,
+            Err(_) => return toml_str.to_string(),
+        };
+        doc.as_table_mut().remove("profile");
+        doc.to_string()
     }
 
     fn ensure_local_proxy_bypass_env(env: &mut serde_json::Map<String, Value>) {
@@ -216,7 +227,10 @@ impl ProxyService {
         unbracketed.to_ascii_lowercase()
     }
 
-    fn merge_local_proxy_bypass(existing_upper: Option<&str>, existing_lower: Option<&str>) -> String {
+    fn merge_local_proxy_bypass(
+        existing_upper: Option<&str>,
+        existing_lower: Option<&str>,
+    ) -> String {
         let mut merged = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
@@ -1782,18 +1796,18 @@ impl ProxyService {
             .map_err(|e| format!("读取 Codex 当前供应商失败: {e}"))?
             .ok_or_else(|| format!("Codex 当前供应商不存在: {current_id}"))?;
 
-        let mut effective_settings =
-            build_effective_settings_with_common_config(self.db.as_ref(), &AppType::Codex, &provider)
-                .map_err(|e| format!("构建 Codex 有效配置失败: {e}"))?;
+        let mut effective_settings = build_effective_settings_with_common_config(
+            self.db.as_ref(),
+            &AppType::Codex,
+            &provider,
+        )
+        .map_err(|e| format!("构建 Codex 有效配置失败: {e}"))?;
 
         Self::preserve_codex_live_extras_for_takeover(&mut effective_settings, existing_live);
         Ok(effective_settings)
     }
 
-    fn preserve_codex_live_extras_for_takeover(
-        target_settings: &mut Value,
-        existing_live: &Value,
-    ) {
+    fn preserve_codex_live_extras_for_takeover(target_settings: &mut Value, existing_live: &Value) {
         let Some(target_obj) = target_settings.as_object_mut() else {
             log::warn!("Codex takeover 基础配置不是对象，跳过保留 live extras");
             return;
@@ -1809,7 +1823,9 @@ impl ProxyService {
             match target_config.parse::<toml_edit::DocumentMut>() {
                 Ok(doc) => doc,
                 Err(err) => {
-                    log::warn!("解析 Codex takeover 基础 config.toml 失败，跳过保留 live extras: {err}");
+                    log::warn!(
+                        "解析 Codex takeover 基础 config.toml 失败，跳过保留 live extras: {err}"
+                    );
                     return;
                 }
             }
@@ -1849,9 +1865,7 @@ impl ProxyService {
             match target_doc.as_table_mut().get_mut(key) {
                 Some(target_item) => Self::merge_codex_toml_item(target_item, existing_item),
                 None => {
-                    target_doc
-                        .as_table_mut()
-                        .insert(key, existing_item.clone());
+                    target_doc.as_table_mut().insert(key, existing_item.clone());
                 }
             }
         }
@@ -3082,8 +3096,7 @@ requires_openai_auth = true
             }),
             None,
         );
-        db.save_provider("codex", &provider)
-            .expect("save provider");
+        db.save_provider("codex", &provider).expect("save provider");
         db.set_current_provider("codex", "p1")
             .expect("set current provider");
         crate::settings::set_current_provider(&AppType::Codex, Some("p1"))
@@ -3155,6 +3168,100 @@ trust_level = "trusted"
                 .and_then(|v| v.as_str()),
             Some("trusted"),
             "user project trust should be preserved"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn codex_takeover_removes_top_level_profile_override() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        db.set_config_snippet(
+            "codex",
+            Some(
+                r#"profile = "default"
+[profiles.default]
+model_provider = "openai"
+model = "gpt-5"
+"#
+                .to_string(),
+            ),
+        )
+        .expect("set codex snippet");
+
+        let service = ProxyService::new(db.clone());
+
+        let mut provider = Provider::with_id(
+            "p1".to_string(),
+            "P1".to_string(),
+            json!({
+                "auth": {
+                    "OPENAI_API_KEY": "provider-key"
+                },
+                "config": r#"model_provider = "custom"
+model = "gpt-5.4"
+
+[model_providers.custom]
+name = "custom"
+base_url = "https://api.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            common_config_enabled: Some(true),
+            ..Default::default()
+        });
+        db.save_provider("codex", &provider).expect("save provider");
+        db.set_current_provider("codex", "p1")
+            .expect("set current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some("p1"))
+            .expect("set local current provider");
+
+        crate::config::write_json_file(
+            &crate::codex_config::get_codex_auth_path(),
+            &json!({ "OPENAI_API_KEY": "live-token" }),
+        )
+        .expect("seed auth.json");
+        std::fs::write(crate::codex_config::get_codex_config_path(), "").expect("seed config.toml");
+
+        service
+            .takeover_live_config_strict(&AppType::Codex)
+            .await
+            .expect("takeover codex live");
+
+        let live = service.read_codex_live().expect("read live config");
+        let config_str = live
+            .get("config")
+            .and_then(|value| value.as_str())
+            .expect("config string");
+        let parsed: toml::Value = toml::from_str(config_str).expect("parse live codex config");
+
+        assert!(
+            parsed.get("profile").is_none(),
+            "takeover must remove top-level profile override to avoid bypassing proxy route"
+        );
+        assert_eq!(
+            parsed
+                .get("model_providers")
+                .and_then(|v| v.get("custom"))
+                .and_then(|v| v.get("base_url"))
+                .and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:15721/v1"),
+            "active provider base_url should still point to local proxy"
+        );
+        assert_eq!(
+            parsed
+                .get("profiles")
+                .and_then(|v| v.get("default"))
+                .and_then(|v| v.get("model_provider"))
+                .and_then(|v| v.as_str()),
+            Some("openai"),
+            "profiles table can be preserved; only top-level profile selector should be removed"
         );
     }
 }
