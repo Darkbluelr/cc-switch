@@ -37,6 +37,7 @@ maybeInjectLocalConfig(tauriArgs);
 
 const child = spawn(PNPM_BIN, ["exec", "tauri", ...tauriArgs], {
   stdio: "inherit",
+  shell: process.platform === "win32",
 });
 
 child.on("exit", (code) => {
