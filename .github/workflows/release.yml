@@ -90,53 +90,43 @@ jobs:
       - name: Prepare Tauri signing key
         shell: bash
         run: |
-          # 目标：提供正确的私钥“文件路径”给 Tauri CLI，避免内容解码歧义
-          KEY_PATH="$RUNNER_TEMP/tauri_signing.key"
+          set -euo pipefail
+          # 在工作区写入密钥，避免 Windows 下 RUNNER_TEMP 路径风格差异
+          KEY_PATH="$PWD/.tauri-signing.key"
           RAW="${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}"
-          if [ -z "$RAW" ]; then
+          if [ -n "$RAW" ]; then
+            # 情况 1：原始两行文本（第一行以 "untrusted comment:" 开头）
+            if echo "$RAW" | head -n1 | grep -q '^untrusted comment:'; then
+              printf '%s\n' "$RAW" > "$KEY_PATH"
+              echo "✅ 使用原始两行密钥文件格式"
+            # 情况 2：整体被 base64 包裹（解包后应当是两行）
+            elif DECODED=$(printf '%s' "$RAW" | (base64 --decode 2>/dev/null || base64 -D 2>/dev/null)) \
+              && echo "$DECODED" | head -n1 | grep -q '^untrusted comment:'; then
+              printf '%s\n' "$DECODED" > "$KEY_PATH"
+              echo "✅ 成功解码 base64 包裹密钥，已还原为两行文件"
+            # 情况 3：已是第二行（纯 Base64 一行）→ 构造两行文件
+            elif echo "$RAW" | grep -Eq '^[A-Za-z0-9+/=]+$'; then
+              ONE=$(printf '%s' "$RAW" | tr -d '\r\n')
+              printf '%s\n%s\n' "untrusted comment: tauri signing key" "$ONE" > "$KEY_PATH"
+              echo "✅ 使用一行 Base64 私钥，已构造两行文件"
+            else
+              echo "❌ TAURI_SIGNING_PRIVATE_KEY 格式无法识别：既不是两行原文，也不是其 base64，亦非一行 base64" >&2
+              echo "密钥前10个字符: $(echo "$RAW" | head -c 10)..." >&2
+              exit 1
+            fi
+          else
             echo "⚠️ TAURI_SIGNING_PRIVATE_KEY 未配置，生成临时签名密钥（仅用于本次构建）"
             pnpm tauri signer generate --ci -w "$KEY_PATH" --force
           fi
-          # 情况 1：原始两行文本（第一行以 "untrusted comment:" 开头）
-          if [ -n "$RAW" ] && echo "$RAW" | head -n1 | grep -q '^untrusted comment:'; then
-            printf '%s\n' "$RAW" > "$KEY_PATH"
-            echo "✅ 使用原始两行密钥文件格式"
-          else
-            # 情况 2：整体被 base64 包裹（解包后应当是两行）
-            if [ -n "$RAW" ] && DECODED=$(printf '%s' "$RAW" | (base64 --decode 2>/dev/null || base64 -D 2>/dev/null)) \
-               && echo "$DECODED" | head -n1 | grep -q '^untrusted comment:'; then
-              printf '%s\n' "$DECODED" > "$KEY_PATH"
-              echo "✅ 成功解码 base64 包裹密钥，已还原为两行文件"
-            else
-              # 情况 3：已是第二行（纯 Base64 一行）→ 构造两行文件
-              if [ -n "$RAW" ] && echo "$RAW" | grep -Eq '^[A-Za-z0-9+/=]+$'; then
-                ONE=$(printf '%s' "$RAW" | tr -d '\r\n')
-                printf '%s\n%s\n' "untrusted comment: tauri signing key" "$ONE" > "$KEY_PATH"
-                echo "✅ 使用一行 Base64 私钥，已构造两行文件"
-              else
-                if [ ! -f "$KEY_PATH" ]; then
-                  echo "❌ TAURI_SIGNING_PRIVATE_KEY 格式无法识别：既不是两行原文，也不是其 base64，亦非一行 base64" >&2
-                  echo "密钥前10个字符: $(echo "$RAW" | head -c 10)..." >&2
-                  exit 1
-                fi
-              fi
-            fi
-          fi
-          # 将“完整两行内容”作为环境变量注入（Tauri 支持传入完整私钥文本或文件路径）
-          # 使用多行写入语法，保持换行以便解析
-          # 将完整两行私钥内容进行 base64 编码，作为单行内容注入环境变量
-          if command -v base64 >/dev/null 2>&1; then
-            KEY_B64=$(base64 < "$KEY_PATH" | tr -d '\r\n')
-          elif command -v openssl >/dev/null 2>&1; then
-            KEY_B64=$(openssl base64 -A -in "$KEY_PATH")
-          else
-            KEY_B64=$(KEY_PATH="$KEY_PATH" node -e "process.stdout.write(require('fs').readFileSync(process.env.KEY_PATH).toString('base64'))")
-          fi
-          if [ -z "$KEY_B64" ]; then
-            echo "❌ 无法生成私钥 base64 内容" >&2
+
+          if [ ! -s "$KEY_PATH" ]; then
+            echo "❌ 未能写入有效的 Tauri 私钥文件: $KEY_PATH" >&2
             exit 1
           fi
-          echo "TAURI_SIGNING_PRIVATE_KEY=$KEY_B64" >> "$GITHUB_ENV"
+
+          # Tauri 支持这里传“路径”或“密钥文本”，统一传路径避免换行/编码差异
+          echo "TAURI_SIGNING_PRIVATE_KEY=$KEY_PATH" >> "$GITHUB_ENV"
+          echo "TAURI_SIGNING_PRIVATE_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
           if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" ]; then
             echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" >> $GITHUB_ENV
           fi
